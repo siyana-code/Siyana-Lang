@@ -6,8 +6,8 @@ Two primitive types. Everything else derives from them.
 
 | Type | Description |
 | --- | --- |
-| `Number` | Integer arithmetic. The single numeric type. |
-| `Character` | A single byte, 0–255. |
+| `Number` | 64-bit signed integer. The default. |
+| `Character` | A single byte, 0-255. Unsigned. |
 
 `Number` and `Character` are the only types with no dependency on another type.
 Everything else is defined in terms of them, in the standard library, using the

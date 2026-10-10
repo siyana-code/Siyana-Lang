@@ -202,7 +202,7 @@ Test-Case 'If (0) is False'        { Test-Output 'If (0) { Terminal.Write("yes")
 Test-Case 'If (42) is True'        { Test-Output 'If (42) { Terminal.Write("yes"); }' @('yes') }
 Test-Case 'Loop (0) does not run'  { Test-Output 'Loop (0) { Terminal.Write("x"); }' @() }
 Test-Case 'If on a String is an error' {
-    Test-Diagnostic 'If ("x") { }' "condition of 'If' must be Number or Character"
+    Test-Diagnostic 'If ("x") { }' "condition of 'If' must be an integer"
 }
 
 # --- Variables --------------------------------------------------------------
@@ -219,11 +219,22 @@ Test-Case 'reassignment' {
 Test-Case 'undefined variable is an error' {
     Test-Diagnostic 'Terminal.Write(nope);' "undefined variable 'nope'"
 }
-Test-Case 'Number cannot hold a Character' {
+Test-Case 'Number cannot hold a Character literal' {
+    # A Character *literal* cannot become a Number: narrowing is only from a
+    # Number literal, never across the byte boundary.
     Test-Diagnostic "Variable x: Number = 'a';" 'cannot initialise'
 }
-Test-Case 'Character cannot hold a Number' {
-    Test-Diagnostic 'Variable c: Character = 65;' 'cannot initialise'
+Test-Case 'a Number literal narrows to Character when it fits' {
+    Test-Output 'Variable c: Character = 65; Terminal.Write(c);' @('A')
+}
+Test-Case 'a Number literal does not narrow past Character' {
+    Test-Diagnostic 'Variable c: Character = 300;' 'cannot initialise'
+}
+Test-Case 'a Number literal narrows to Number32 when it fits' {
+    Test-Output 'Variable n: Number32 = 5; Terminal.Write(n);' @('5')
+}
+Test-Case 'a Number literal does not narrow to Number32 when too large' {
+    Test-Diagnostic 'Variable n: Number32 = 5000000000;' 'cannot initialise'
 }
 Test-Case 'duplicate declaration is an error' {
     Test-Diagnostic 'Variable x: Number = 1; Variable x: Number = 2;' 'already declared'
@@ -301,7 +312,60 @@ Test-Case 'wrong argument type is an error' {
     Test-Diagnostic "Function F(a: Number) { } F('c');" "parameter 'a'.*expects Number"
 }
 Test-Case 'unknown type is an error' {
-    Test-Diagnostic 'Variable x: Widget = 1;' "expected type 'Number' or 'Character'"
+    Test-Diagnostic 'Variable x: Widget = 1;' "expected type 'Number', 'Number32', 'Word', or 'Character'"
+}
+
+# --- Integer widths ---------------------------------------------------------
+
+Test-Case 'Number32 holds 32-bit values' {
+    Test-Output 'Variable n: Number32 = 2147483647; Terminal.Write(n);' @('2147483647')
+}
+Test-Case 'Word holds large sizes' {
+    Test-Output 'Variable w: Word = 4294967295; Terminal.Write(w);' @('4294967295')
+}
+Test-Case 'Word is unsigned, so it cannot go negative' {
+    Test-Diagnostic 'Variable w: Word = 0; w = w - 1;' 'overflow'
+}
+Test-Case 'a negative literal cannot adopt Word' {
+    # The protection that matters: a positive literal is unambiguously that
+    # value whatever type it becomes, but a negative one must never be
+    # reinterpreted as a huge unsigned number.
+    Test-Diagnostic 'Variable w: Word = 0; w = w + -1;' 'same type'
+}
+Test-Case 'negating a Word is an error' {
+    Test-Diagnostic 'Variable w: Word = 1; Terminal.Write(-w);' 'no negative values'
+}
+Test-Case 'Number32 overflow is an error, not a wrap' {
+    # The critical guarantee. C would silently produce -2147483648 here.
+    Test-Diagnostic 'Variable n: Number32 = 2147483647; Variable m: Number32 = n + 1;' 'overflow'
+}
+Test-Case 'Number32 underflow is an error' {
+    Test-Diagnostic 'Variable n: Number32 = -2147483648; Variable m: Number32 = n - 1;' 'overflow'
+}
+Test-Case 'Number overflow is an error' {
+    Test-Diagnostic 'Variable n: Number = 9223372036854775807; Variable m: Number = n + 1;' 'overflow'
+}
+Test-Case 'Character overflow is an error, not a wrap to zero' {
+    Test-Diagnostic 'Variable c: Character = 255; Variable d: Character = c + 1;' 'overflow'
+}
+Test-Case 'mixed widths cannot be added' {
+    Test-Diagnostic 'Variable a: Number32 = 1; Variable b: Number = 1; Variable c: Number = a + b;' 'same type'
+}
+Test-Case 'Number32 and Number cannot be compared' {
+    Test-Diagnostic 'Variable a: Number32 = 1; Variable b: Number = 1; Terminal.Write(a == b);' 'cannot compare'
+}
+Test-Case 'mixed widths multiply is rejected' {
+    Test-Diagnostic 'Variable c: Character = 1; Variable n: Number = 2; Variable r: Number = c * n;' 'same type'
+}
+Test-Case 'arithmetic yields the operand type' {
+    Test-Output 'Variable a: Number32 = 3; Variable b: Number32 = 4; Variable c: Number32 = a * b; Terminal.Write(c);' @('12')
+}
+Test-Case 'Word arithmetic works' {
+    Test-Output 'Variable w: Word = 100; Variable x: Word = w - 30; Terminal.Write(x);' @('70')
+}
+Test-Case 'Word comparison is unsigned' {
+    # Signed comparison would make 0-1 appear less than any positive value.
+    Test-Output 'Variable w: Word = 4294967295; Terminal.Write(w > 1);' @('True')
 }
 
 # --- Comments ---------------------------------------------------------------

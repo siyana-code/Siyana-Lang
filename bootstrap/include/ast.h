@@ -53,15 +53,30 @@ typedef enum {
     OP_GREATER_EQUAL
 } Operator;
 
-/* The two primitive types. bool is not among them: it is Number restricted to
- * 0 and 1, following C. That is a deliberate reduction in safety, recorded as
- * decision 17. */
+/* The integer types.
+ *
+ * An OS cannot be written with a single unqualified integer: a network header,
+ * an ioctl struct, a memory address, and a buffer size all need different
+ * widths. See research/design/integer-types.md, which records the research
+ * behind this set.
+ *
+ * bool is not a separate type. It is Number restricted to 0 and 1, following
+ * C (decision 17). */
 typedef enum {
-    TYPE_NUMBER,
-    TYPE_CHARACTER
+    TYPE_NUMBER,     /* 64-bit signed. The default. */
+    TYPE_NUMBER32,   /* 32-bit signed. Error codes and 32-bit ABI values. */
+    TYPE_WORD,       /* Pointer-width unsigned. Sizes, indexes, addresses. */
+    TYPE_CHARACTER   /* 8-bit unsigned. Bytes. */
 } TypeKind;
 
 const char *type_kind_name(TypeKind type);
+
+/* Size in bytes. `Word` reports the pointer width of the build target, which
+ * is the one width that is not fixed. */
+size_t type_kind_size(TypeKind type);
+
+/* True when the type can represent only non-negative values. */
+bool type_kind_is_unsigned(TypeKind type);
 
 typedef struct Expr Expr;
 typedef struct Stmt Stmt;

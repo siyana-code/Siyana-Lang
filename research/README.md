@@ -8,6 +8,7 @@ evidence base that decisions get argued from.
 
 | File | What it covers |
 | --- | --- |
+| [design/integer-types.md](design/integer-types.md) | Fixed-width integers, and why an OS cannot do without them |
 | [design/type-system.md](design/type-system.md) | The two primitive types, derived types, and the rules that connect them |
 | [design/keywords-and-io.md](design/keywords-and-io.md) | Full-name keywords, and Terminal as a value |
 | [decisions.md](decisions.md) | Decisions made, with reasoning, including corrections and reversals |
