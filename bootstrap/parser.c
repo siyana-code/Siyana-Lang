@@ -68,6 +68,7 @@ static Expr *parse_assignment(Parser *parser);
 static bool is_name_token(TokenType type);
 
 static bool parse_block(Parser *parser, Stmt ***body, size_t *count);
+static Expr *parse_postfix(Parser *parser, Expr *base);
 
 /* expr_free releases Catch arms, which hold statements, so the two recurse into
  * each other and one of them has to be declared first. */
@@ -259,6 +260,11 @@ static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named) {
         return false;
     }
 
+    if (match(parser, TOKEN_ALLOCATOR)) {
+        *out_type = TYPE_ALLOCATOR;
+        return true;
+    }
+
     if (match(parser, TOKEN_NUMBER_TYPE)) {
         *out_type = TYPE_NUMBER;
         return true;
@@ -336,6 +342,30 @@ static bool parse_result_type(Parser *parser, Stmt *stmt) {
 
 static Expr *parse_primary(Parser *parser) {
     const Token *token = current(parser);
+
+    /* `Allocator(bytes)` -- the constructor. Distinguished from the
+     * `allocator(x) { }` block form, which is a statement, by being parsed
+     * here among the primary expressions. */
+    if (match(parser, TOKEN_ALLOCATOR)) {
+        Position start = current(parser)->start;
+        if (!consume(parser, TOKEN_LPAREN, "'(' after 'Allocator'")) return NULL;
+
+        Expr *construct = expr_new(parser, EXPR_ALLOCATOR_NEW, start);
+        if (construct == NULL) return NULL;
+
+        parser->suppress_struct_literal = true;
+        construct->right = parse_expression(parser);
+        parser->suppress_struct_literal = false;
+        if (parser->failed) {
+            expr_free(construct);
+            return NULL;
+        }
+        if (!consume(parser, TOKEN_RPAREN, "closing ')' after an Allocator capacity")) {
+            expr_free(construct);
+            return NULL;
+        }
+        return parse_postfix(parser, construct);
+    }
 
     /* Builtins are recognised here and lowered to a call node carrying a
      * builtin token type rather than a callee. Terminal is designed as a value
@@ -470,12 +500,16 @@ static Expr *parse_primary(Parser *parser) {
  * so they sit above calls in the precedence chain and are reached from
  * parse_call.
  *
- * Note a genuine ambiguity: `P.x` is a field read when P is a variable and a
- * union constructor when P is a union type. No syntactic lookahead can tell
- * them apart, because both forms are `IDENT . IDENT`. This was handled by
- * guessing here and was wrong -- it made every `p.field` a constructor attempt.
- * Now both cases produce one node and the interpreter decides from the declared
- * types, which is the only place the answer actually exists. */
+ * Three shapes share one production, which is why the runtime has to resolve
+ * them:
+ *
+ *   `p.x`              a struct field read
+ *   `Value.Number(n)`  a union construction, one payload
+ *   `a.Allocate(n)`    a method call, any number of arguments
+ *
+ * `Name.Variant` is `IDENT . IDENT`, and `a.Allocate` is too. No syntactic
+ * lookahead separates them. Both produce one node and the interpreter decides
+ * from the declared types, which is the only place the answer exists. */
 /* Parses the arms of a `Catch`:
  *
  *     Catch {
@@ -557,13 +591,15 @@ static bool parse_catch_arms(Parser *parser, Expr *handle) {
         if (!parse_block(parser, &arm->body, &arm->body_count)) return false;
 
         /* Every arm must produce a value, because the Catch as a whole stands in
-         * for the success value. An arm that cannot is a bug, and finding it at
-         * the arm rather than at the use makes the message point somewhere
-         * useful. */
-        if (arm->body_count == 0 || arm->body[arm->body_count - 1]->type != STMT_EXPR) {
+         * for the success value. `Fail` is also accepted as the last statement:
+         * it gives up and propagates that error rather than recovering, so there
+         * is no value to produce. */
+        if (arm->body_count == 0 ||
+            (arm->body[arm->body_count - 1]->type != STMT_EXPR &&
+             arm->body[arm->body_count - 1]->type != STMT_FAIL)) {
             fail(parser, arm->position,
-                 "Catch arm '%s' must end with an expression giving the value to use",
-                 arm->variant);
+                 "Catch arm '%s' must end with an expression giving the value to "
+                 "use, or with Fail", arm->variant);
             return false;
         }
 
@@ -598,17 +634,55 @@ static Expr *parse_postfix(Parser *parser, Expr *base) {
         access->left = base;
         access->name = copy_ident(member);
 
-        /* A '(' turns it into a construction, which is how a union variant with
-         * a payload is written. */
+        /* A '(' turns it into a construction or a method call, which is how
+         * `Value.Number(42)` and `a.Allocate(16)` are both written.
+         *
+         * The full argument list is parsed here rather than assuming one,
+         * because methods take several arguments and a union variant takes
+         * exactly one. */
         if (match(parser, TOKEN_LPAREN)) {
-            access->payload = parse_expression(parser);
-            if (parser->failed) {
+            /* Zero arguments is legal: `arena.Used()` takes none. */
+            if (!check(parser, TOKEN_RPAREN)) {
+                do {
+                if (access->argument_count == 0) {
+                    access->arguments = malloc(sizeof(Expr *));
+                } else {
+                    access->arguments = realloc(access->arguments,
+                                                (access->argument_count + 1) * sizeof(Expr *));
+                }
+                if (access->arguments == NULL) {
+                    fail(parser, access->position, "out of memory");
+                    expr_free(access);
+                    return NULL;
+                }
+
+                Expr *argument = parse_expression(parser);
+                if (parser->failed) {
+                    expr_free(access);
+                    return NULL;
+                }
+                argument = parse_postfix(parser, argument);
+                if (parser->failed) {
+                    expr_free(argument);
+                    expr_free(access);
+                    return NULL;
+                }
+                access->arguments[access->argument_count++] = argument;
+                } while (match(parser, TOKEN_COMMA));
+            }
+
+            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a payload or arguments")) {
                 expr_free(access);
                 return NULL;
             }
-            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a variant payload")) {
-                expr_free(access);
-                return NULL;
+
+            /* A union variant carries exactly one payload, so its single
+             * argument is what `payload` names. Deliberately the *same* node,
+             * not a second pointer to it: expr_free releases both fields, and a
+             * shared pointer there is a double free. */
+            if (access->argument_count == 1) {
+                access->payload = access->arguments[0];
+                access->arguments[0] = NULL;
             }
         }
 
@@ -733,7 +807,7 @@ static Expr *parse_postfix(Parser *parser, Expr *base) {
 
         /* Rule 1: a fallible call is handled here, so record that on the call
          * itself. The parser is the only place this relationship is visible. */
-        if (base->type == EXPR_CALL) base->handled = true;
+        if (base->type == EXPR_CALL || base->type == EXPR_FIELD) base->handled = true;
 
         return parse_postfix(parser, propagate);
     }
@@ -747,7 +821,7 @@ static Expr *parse_postfix(Parser *parser, Expr *base) {
         }
         handle->position = base->position;
         handle->left = base;
-        if (base->type == EXPR_CALL) base->handled = true;
+        if (base->type == EXPR_CALL || base->type == EXPR_FIELD) base->handled = true;
 
         if (!parse_catch_arms(parser, handle)) {
             expr_free(handle);
@@ -1423,6 +1497,44 @@ static Stmt *parse_aggregate(Parser *parser, DeclKind kind, TokenType keyword) {
  * without a way to originate an error no function could ever return one and the
  * whole mechanism would be untestable.
  */
+/* `allocator(x) { ... }` -- binds `x` as the current allocator for the block.
+ *
+ * The expression is evaluated once, on entry. `allocator(scratch.Get())` and
+ * `allocator(next_free_arena())` are therefore both well defined, which a
+ * binding of the name alone would not be.
+ */
+static Stmt *parse_allocator_block(Parser *parser) {
+    Position start = current(parser)->start;
+    advance_token(parser); /* 'Allocator' */
+
+    Stmt *stmt = stmt_new(parser, STMT_ALLOCATOR, start);
+    if (stmt == NULL) return NULL;
+
+    if (!consume(parser, TOKEN_LPAREN, "'(' after 'allocator'")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    /* Suppressed for the same reason as an If condition: `allocator(x) { ... }`
+     * puts an identifier in front of a brace. */
+    bool saved = parser->suppress_struct_literal;
+    parser->suppress_struct_literal = true;
+    stmt->expression = parse_expression(parser);
+    parser->suppress_struct_literal = saved;
+
+    if (parser->failed || !consume(parser, TOKEN_RPAREN, "closing ')' after an allocator")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    if (!parse_block(parser, &stmt->body, &stmt->body_count)) {
+        stmt_free(stmt);
+        return NULL;
+    }
+    return stmt;
+}
+
+/* `Allocator(bytes)` -- a region of that capacity. */
 static Stmt *parse_fail(Parser *parser) {
     Position start = current(parser)->start;
     advance_token(parser); /* 'Fail' */
@@ -1596,6 +1708,7 @@ static Stmt *parse_statement(Parser *parser) {
         case TOKEN_ERROR:      return parse_aggregate(parser, DECL_UNION, TOKEN_ERROR);
         case TOKEN_MATCH:      return parse_match(parser);
         case TOKEN_FAIL:      return parse_fail(parser);
+        case TOKEN_ALLOCATOR:  return parse_allocator_block(parser);
         case TOKEN_IF:    return parse_if(parser);
     case TOKEN_LOOP:   return parse_loop(parser);
         case TOKEN_RETURN: {

@@ -75,6 +75,21 @@ typedef struct {
     const Stmt *current_function;
     Propagation propagation;
 
+    /* The allocator bound by the innermost `allocator(x) { }` block, or NULL.
+     * NULL means no binding, and `Allocate` then fails rather than guessing --
+     * a silent fallback would be the ambient model decision 14 rejected. */
+    struct Allocator *current_allocator;
+
+    /* Every allocator made, freed at teardown.
+     *
+     * An arena has exactly one owner -- the run -- so unlike a struct's field
+     * array (see the note in docs/architecture.md) this needs no ownership
+     * decision. Collecting them costs one array and removes the leak entirely,
+     * rather than recording it. */
+    struct Allocator **allocators;
+    size_t allocator_count;
+    size_t allocator_capacity;
+
     bool failed;
     char message[192];
     Position error_position;
@@ -194,6 +209,7 @@ const char *type_kind_name(TypeKind type) {
         case TYPE_WORD:      return "Word";
         case TYPE_CHARACTER: return "Character";
         case TYPE_NAMED:     return "a named type";
+        case TYPE_ALLOCATOR:  return "Allocator";
         default:             return "unknown";
     }
     }
@@ -269,6 +285,7 @@ static bool integer_fits(long long value, TypeKind type) {
  * check -- which is what makes `Variable x: Number32 = 5` legal while
  * `Variable x: Number32 = "a"` is not. */
 static bool value_matches_type(Value value, TypeKind declared) {
+    if (declared == TYPE_ALLOCATOR) return value.type == VALUE_ALLOCATOR;
     if (value.type != VALUE_INTEGER) return false;
     return value.as.integer.type == declared;
 }
@@ -278,6 +295,10 @@ static const char *type_name_of(Value value) {
     switch (value.type) {
         case VALUE_NIL:    return "nothing";
         case VALUE_STRING: return "String";
+        case VALUE_STRUCT: return "a struct";
+        case VALUE_UNION:  return "a union";
+        case VALUE_ALLOCATOR: return "Allocator";
+        case VALUE_RESULT: return "a Result";
         default:           return "unknown";
     }
 }
@@ -355,6 +376,20 @@ static bool make_result_ok(Value inner, Value *out);
 static bool execute_block(InterpState *state, Stmt *const *body, size_t count,
                           Scope *scope, Flow *flow);
 
+/* Defined with the error helpers, but needed by the allocator block: an
+ * exhausted arena produces the predeclared OutOfMemory value. */
+static bool make_result_error(const Decl *decl, size_t variant, Value *out);
+
+/* Resolves `Allocate(n)` with no receiver. It is a fallible call like any
+ * other, so rule 1 has to reach it. */
+static bool evaluate_ambient_allocate(InterpState *state, const Expr *expression,
+                                      Scope *scope, Value *out);
+
+/* Defined with the allocator helpers; every size and offset in the language is
+ * a Word, so the narrowing rule is needed in all three of those functions. */
+static bool require_word(InterpState *state, const char *what, Position position,
+                         Value value, long long *out);
+
 /* --- Values ---------------------------------------------------------------- */
 
 /* Builds an integer value of the given Siyana type. Callers are responsible
@@ -370,6 +405,14 @@ static Value value_integer(long long bits, TypeKind type) {
 
 static Value value_number(long long bits) {
     return value_integer(bits, TYPE_NUMBER);
+}
+
+static Value value_word(long long bits) {
+    return value_integer(bits, TYPE_WORD);
+}
+
+static Value value_character(long long bits) {
+    return value_integer(bits, TYPE_CHARACTER);
 }
 
 static Value value_string(const char *chars, size_t length) {
@@ -1071,7 +1114,13 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
     const char *name = expression->callee->name;
 
     const Function *function = find_function(state, name);
-    if (function == NULL) {
+    /* `Allocate(n)` with no receiver allocates from the current binding. Treated
+     * as a fallible call so rule 1 applies to it exactly as to any other: the
+     * error has to be handled where the call is written. Resolved after the user
+     * functions, so a program may define its own Allocate and shadow it. */
+    bool ambient = function == NULL && strcmp(name, "Allocate") == 0;
+
+    if (function == NULL && !ambient) {
         fail(state, expression->position, "undefined function '%s'", name);
         return false;
     }
@@ -1093,14 +1142,21 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
         }
     }
 
-    if (ok) ok = call_function(state, function, arguments, expression->argument_count, out);
+    if (ok) {
+        ok = ambient
+                 ? evaluate_ambient_allocate(state, expression, scope, out)
+                 : call_function(state, function, arguments, expression->argument_count, out);
+    }
     free(arguments);
     if (!ok) return false;
 
     /* Rule 1: a call that can fail must be handled at the point of the call.
      * The parser marked this node when it is the operand of Try or Catch, which
-     * is the only place that relationship is visible. */
-    if (function->declaration->declared_type == TYPE_RESULT && !expression->handled) {
+     * is the only place that relationship is visible. The ambient Allocate is
+     * fallible in the same way and is held to the same rule. */
+    bool can_fail = ambient ||
+                    function->declaration->declared_type == TYPE_RESULT;
+    if (can_fail && !expression->handled) {
         fail(state, expression->position,
              "'%s' can fail; follow the call with Try or Catch", name);
         return false;
@@ -1112,6 +1168,328 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
 /* --- Aggregates: structs and unions ---------------------------------------- */
 
 /* Finds a registered Struct or Union by name, or NULL. */
+/* --- Allocators ------------------------------------------------------------ */
+
+/* A bump allocator over one owned region.
+ *
+ * Handing out offsets rather than references is a deliberate Phase 3 choice:
+ * Siyana has no pointers, and open question 6 (does a Buffer alias, and who
+ * owns it) is deliberately undecided. A kernel's page allocator returns a
+ * frame number for the same reason -- access goes back through the allocator.
+ * See research/design/allocators.md. */
+typedef struct Allocator {
+    unsigned char *bytes;
+    size_t capacity;
+    size_t used;
+} Allocator;
+
+/* The predeclared error set.
+ *
+ * `Memory` exists before the program starts, like `Number` does, so that
+ * `Allocate`'s signature can declare an error set without the user writing one.
+ * Writing `Error Memory { ... }` is a duplicate-name error rather than a
+ * silent redefinition -- the same rule structs and unions already follow. */
+static char memory_type_name[] = "Memory";
+static char out_of_memory_name[] = "OutOfMemory";
+static Field memory_field = {
+    .name = out_of_memory_name,
+    .type = TYPE_CHARACTER,
+    .position = {0, 0},
+    .has_payload = false
+};
+static Stmt memory_node = {
+    .type = STMT_UNION,
+    .position = {0, 0},
+    .name = memory_type_name,
+    .decl_kind = DECL_UNION,
+    .fields = &memory_field,
+    .field_count = 1
+};
+static Decl memory_decl = { .node = &memory_node, .is_union = true };
+
+static Allocator *allocator_create(size_t capacity) {
+    if (capacity == 0) return NULL;
+    Allocator *allocator = calloc(1, sizeof(Allocator));
+    if (allocator == NULL) return NULL;
+    allocator->bytes = malloc(capacity);
+    if (allocator->bytes == NULL) {
+        free(allocator);
+        return NULL;
+    }
+    allocator->capacity = capacity;
+    allocator->used = 0;
+    return allocator;
+}
+
+/* Registers an allocator for teardown. Returns false only when the registry
+ * itself cannot grow, in which case the caller frees the allocator. */
+static bool allocator_track(InterpState *state, Allocator *allocator) {
+    if (state->allocator_count + 1 > state->allocator_capacity) {
+        size_t capacity = state->allocator_capacity ? state->allocator_capacity * 2 : 8;
+        Allocator **grown = realloc(state->allocators, capacity * sizeof(Allocator *));
+        if (grown == NULL) return false;
+        state->allocators = grown;
+        state->allocator_capacity = capacity;
+    }
+    state->allocators[state->allocator_count++] = allocator;
+    return true;
+}
+
+static void allocator_destroy(Allocator *allocator) {
+    if (allocator == NULL) return;
+    free(allocator->bytes);
+    free(allocator);
+}
+
+/* Hands out `size` bytes, or reports that it cannot. Never aborts: the whole
+ * point of the model is that exhaustion is a value. */
+static bool allocator_allocate(Allocator *allocator, size_t size, size_t *out_offset) {
+    if (size > allocator->capacity - allocator->used) return false;
+    *out_offset = allocator->used;
+    allocator->used += size;
+    return true;
+}
+
+/* `Allocator(bytes)` */
+static bool evaluate_allocator_new(InterpState *state, const Expr *expression,
+                                   Scope *scope, Value *out) {
+    Value capacity;
+    if (!evaluate(state, expression->right, scope, &capacity)) return false;
+
+    long long bytes = 0;
+    if (!require_word(state, "an Allocator's capacity", expression->position,
+                      capacity, &bytes)) {
+        return false;
+    }
+    if (bytes == 0) {
+        fail(state, expression->position, "an Allocator's capacity must be greater than zero");
+        return false;
+    }
+
+    Allocator *allocator = allocator_create((size_t)bytes);
+    if (allocator == NULL) {
+        fail(state, expression->position, "out of memory creating an Allocator");
+        return false;
+    }
+    if (!allocator_track(state, allocator)) {
+        allocator_destroy(allocator);
+        fail(state, expression->position, "out of memory tracking an Allocator");
+        return false;
+    }
+
+    out->type = VALUE_ALLOCATOR;
+    memset(&out->as, 0, sizeof(out->as));
+    out->as.allocator = allocator;
+    return true;
+}
+
+/* The OutOfMemory failure, for the paths where allocation did not fit. */
+static bool make_out_of_memory(Value *out) {
+    return make_result_error(&memory_decl, 0, out);
+}
+
+/* Requires a Word, narrowing a Number literal that fits.
+ *
+ * Same contextual-narrowing rule as a variable initialiser, for the same
+ * reason: `arena.Allocate(4096)` should not have to be written
+ * `arena.Allocate(4096: Word)` at every call site. Sizes and offsets are Words
+ * everywhere else in the language, so a bare literal almost always is one. */
+static bool require_word(InterpState *state, const char *what, Position position,
+                         Value value, long long *out) {
+    if (value.type == VALUE_INTEGER) {
+        if (value.as.integer.type == TYPE_WORD) {
+            *out = value.as.integer.bits;
+            return true;
+        }
+        if (value.as.integer.type == TYPE_NUMBER && integer_fits(value.as.integer.bits, TYPE_WORD)) {
+            *out = value.as.integer.bits;
+            return true;
+        }
+    }
+    fail(state, position, "%s expects a Word, got %s", what, type_name_of(value));
+    return false;
+}
+
+/* Handles `a.Name(...)` on an allocator.
+ *
+ * Returns false with a diagnostic if the name is not a method. A method call is
+ * dispatched here rather than being a separate production because `a.Allocate`
+ * and `Value.Number` are the same three tokens; the receiver's type is the only
+ * thing that tells them apart.
+ */
+static bool evaluate_allocator_method(InterpState *state, const Expr *expression,
+                                      Scope *scope, Allocator *allocator, Value *out) {
+    const char *method = expression->name;
+    size_t argc = expression->argument_count;
+
+    Value args[3];
+    bool ok = true;
+    for (size_t i = 0; ok && i < argc && i < 3; i++) {
+        /* The parser moves a lone argument into `payload`, which is what the
+         * union-construction path reads, and NULLs the array slot. Methods use
+         * the same node, so the first argument comes from `payload` when it is
+         * there. */
+        const Expr *argument = (i == 0 && expression->payload != NULL)
+                                   ? expression->payload
+                                   : expression->arguments[i];
+        ok = evaluate(state, argument, scope, &args[i]);
+    }
+    if (!ok) return false;
+    if (argc > 3) {
+        fail(state, expression->position,
+             "too many arguments to '%s'", method);
+        return false;
+    }
+
+    if (strcmp(method, "Allocate") == 0) {
+        if (argc != 1) {
+            fail(state, expression->position,
+                 "Allocate expects 1 argument, got %zu", argc);
+            return false;
+        }
+        long long requested = 0;
+        if (!require_word(state, "Allocate", expression->position, args[0],
+                          &requested)) {
+            return false;
+        }
+        size_t offset = 0;
+        if (!allocator_allocate(allocator, (size_t)requested, &offset)) {
+            /* The exit criterion: a value, not a crash. */
+            return make_out_of_memory(out);
+        }
+        /* Rule 1 applies to methods too. An unhandled Result from Allocate
+         * would be discarded silently, which is the exact failure the rule
+         * exists to prevent. */
+        if (!expression->handled) {
+            fail(state, expression->position,
+                 "'Allocate' can fail; follow the call with Try or Catch");
+            return false;
+        }
+        return make_result_ok(value_word((long long)offset), out);
+    }
+
+    if (strcmp(method, "Store") == 0) {
+        if (argc != 2) {
+            fail(state, expression->position, "Store expects 2 arguments, got %zu", argc);
+            return false;
+        }
+        long long offset_value = 0;
+        if (!require_word(state, "Store's offset", expression->position, args[0],
+                          &offset_value)) {
+            return false;
+        }
+        if (args[1].type != VALUE_INTEGER) {
+            fail(state, expression->position,
+                 "Store's value must be a Character, got %s", type_name_of(args[1]));
+            return false;
+        }
+        if (args[1].as.integer.type != TYPE_CHARACTER) {
+            /* A literal narrows, as everywhere else. `Store(off, 65)` should not
+             * have to be written `Store(off, 65: Character)`. */
+            if (args[1].as.integer.type == TYPE_NUMBER &&
+                integer_fits(args[1].as.integer.bits, TYPE_CHARACTER)) {
+                args[1] = value_character(args[1].as.integer.bits);
+            } else {
+                fail(state, expression->position,
+                     "Store's value must be a Character, got %s",
+                     type_name_of(args[1]));
+                return false;
+            }
+        }
+        size_t offset = (size_t)offset_value;
+        if (offset >= allocator->used) {
+            /* Out of range is a bug, not an allocation failure, so it stops
+             * rather than becoming a value the programmer has to check. A
+             * kernel reading the wrong frame should not continue quietly. */
+            fail(state, expression->position,
+                 "Store offset %llu is outside this Allocator's %zu allocated byte(s)",
+                 (unsigned long long)offset, allocator->used);
+            return false;
+        }
+        allocator->bytes[offset] = (unsigned char)args[1].as.integer.bits;
+        *out = value_nil();
+        return true;
+    }
+
+    if (strcmp(method, "Load") == 0) {
+        if (argc != 1) {
+            fail(state, expression->position, "Load expects 1 argument, got %zu", argc);
+            return false;
+        }
+        long long offset_value = 0;
+        if (!require_word(state, "Load's offset", expression->position, args[0],
+                          &offset_value)) {
+            return false;
+        }
+        size_t offset = (size_t)offset_value;
+        if (offset >= allocator->used) {
+            fail(state, expression->position,
+                 "Load offset %llu is outside this Allocator's %zu allocated byte(s)",
+                 (unsigned long long)offset, allocator->used);
+            return false;
+        }
+        *out = value_character((long long)allocator->bytes[offset]);
+        return true;
+    }
+
+    if (strcmp(method, "Used") == 0) {
+        if (argc != 0) {
+            fail(state, expression->position, "Used expects 0 arguments, got %zu", argc);
+            return false;
+        }
+        /* What makes the binding observable, and therefore testable: a test can
+         * assert that an allocation inside a block went to the scratch arena
+         * and not the caller's. */
+        *out = value_word((long long)allocator->used);
+        return true;
+    }
+
+    if (strcmp(method, "Capacity") == 0) {
+        if (argc != 0) {
+            fail(state, expression->position, "Capacity expects 0 arguments, got %zu", argc);
+            return false;
+        }
+        *out = value_word((long long)allocator->capacity);
+        return true;
+    }
+
+    fail(state, expression->position, "an Allocator has no method '%s'", method);
+    return false;
+}
+
+/* `Allocate(n)` with no receiver -- from the current binding.
+ *
+ * Falling back to some global when nothing is bound would be Model B, ambient
+ * state with no visible origin, which is what decision 14 rejected. The error
+ * says where the binding belongs instead. */
+static bool evaluate_ambient_allocate(InterpState *state, const Expr *expression,
+                                       Scope *scope, Value *out) {
+    if (state->current_allocator == NULL) {
+        fail(state, expression->position,
+             "no allocator is bound; pass one explicitly or wrap this in an "
+             "allocator(x) { } block");
+        return false;
+    }
+    if (expression->argument_count != 1) {
+        fail(state, expression->position,
+             "Allocate expects 1 argument, got %zu", expression->argument_count);
+        return false;
+    }
+
+    Value size;
+    if (!evaluate(state, expression->arguments[0], scope, &size)) return false;
+    long long requested = 0;
+    if (!require_word(state, "Allocate", expression->position, size, &requested)) {
+        return false;
+    }
+
+    size_t offset = 0;
+    if (!allocator_allocate(state->current_allocator, (size_t)requested, &offset)) {
+        return make_out_of_memory(out);
+    }
+    return make_result_ok(value_word((long long)offset), out);
+}
+
 static const Decl *find_decl(const InterpState *state, const char *name) {
     for (size_t i = 0; i < state->decl_count; i++) {
         if (strcmp(state->decls[i].node->name, name) == 0) return &state->decls[i];
@@ -1350,6 +1728,13 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
     }
 
     if (base.type != VALUE_STRUCT) {
+        if (base.type == VALUE_ALLOCATOR) {
+            /* A method call, dispatched by the receiver's type. `a.Allocate` and
+             * `Value.Number` are the same three tokens; only the receiver
+             * distinguishes them. */
+            return evaluate_allocator_method(state, expression, scope,
+                                            base.as.allocator, out);
+        }
         fail(state, expression->position,
              "cannot read field '%s' from %s", expression->name, type_name_of(base));
         return false;
@@ -1508,15 +1893,34 @@ static void report_missing_errors(InterpState *state, Position position,
  * Both operators require a call, because both need to know the callee's error
  * set, and a call is the only thing that has one. */
 static bool require_fallible_call(InterpState *state, const Expr *expression,
-                                  const Expr **call, Position position) {
+                                  const Expr **call, bool *is_method,
+                                  const char **name, Position position) {
     const Expr *operand = expression->left;
-    if (operand == NULL || operand->type != EXPR_CALL ||
-        operand->callee == NULL || operand->callee->type != EXPR_IDENT) {
-        fail(state, position, "Try and Catch apply to a function call");
-        return false;
+    *is_method = false;
+
+    if (operand != NULL && operand->type == EXPR_CALL) {
+        if (operand->callee == NULL || operand->callee->type != EXPR_IDENT) {
+            fail(state, position, "Try and Catch apply to a function call");
+            return false;
+        }
+        *call = operand;
+        *name = operand->callee->name;
+        return true;
     }
-    *call = operand;
-    return true;
+
+    /* A method call. The left may be an identifier -- `arena.Allocate(n)` -- and at
+     * parse time a variable and a type name are the same token, so this cannot
+     * be narrowed further here. A genuine field read reaching Try is reported
+     * as "cannot fail", which is a correct diagnostic either way. */
+    if (operand != NULL && operand->type == EXPR_FIELD) {
+        *call = operand;
+        *is_method = true;
+        *name = operand->name;
+        return true;
+    }
+
+    fail(state, position, "Try and Catch apply to a function call");
+    return false;
 }
 
 /* `expr Try` -- on failure, return the error from the enclosing function.
@@ -1525,19 +1929,33 @@ static bool require_fallible_call(InterpState *state, const Expr *expression,
  * The rule that matters is the one enforced here: the enclosing function must
  * declare an error set that covers the callee's, or the error would leave a
  * function whose signature cannot describe it. */
+/* The error set a callee can raise, or NULL when it is infallible.
+ *
+ * The ambient `Allocate` and the allocator methods are fallible calls with no
+ * Function entry, so they are resolved here rather than in Try and Catch
+ * separately -- otherwise rule 1 would hold for every fallible call except
+ * those. */
+static const Decl *callee_error_set(const InterpState *state, const char *name,
+                                    bool is_method) {
+    if (is_method) return &memory_decl;
+    const Function *function = find_function(state, name);
+    if (function == NULL) {
+        return strcmp(name, "Allocate") == 0 ? &memory_decl : NULL;
+    }
+    return function_error_set(state, function->declaration);
+}
+
 static bool evaluate_try(InterpState *state, const Expr *expression, Scope *scope,
                          Value *out) {
     const Expr *call = NULL;
-    if (!require_fallible_call(state, expression, &call, expression->position)) return false;
-
-    const char *callee = call->callee->name;
-    const Function *function = find_function(state, callee);
-    if (function == NULL) {
-        fail(state, expression->position, "undefined function '%s'", callee);
+    bool is_method = false;
+    const char *callee = NULL;
+    if (!require_fallible_call(state, expression, &call, &is_method, &callee,
+                               expression->position)) {
         return false;
     }
 
-    const Decl *callee_errors = function_error_set(state, function->declaration);
+    const Decl *callee_errors = callee_error_set(state, callee, is_method);
     if (callee_errors == NULL) {
         fail(state, expression->position, "'%s' cannot fail, so Try has nothing to do",
              callee);
@@ -1575,7 +1993,7 @@ static bool evaluate_try(InterpState *state, const Expr *expression, Scope *scop
      * loop and cleared at the call boundary that owns it. */
     state->propagation.propagating = true;
     state->propagation.error = value;
-    state->propagation.propagating_from = function->declaration;
+    state->propagation.propagating_from = NULL;
     *out = value_nil();
     return true;
 }
@@ -1590,16 +2008,14 @@ static bool evaluate_try(InterpState *state, const Expr *expression, Scope *scop
 static bool evaluate_catch(InterpState *state, const Expr *expression, Scope *scope,
                            Value *out) {
     const Expr *call = NULL;
-    if (!require_fallible_call(state, expression, &call, expression->position)) return false;
-
-    const char *callee = call->callee->name;
-    const Function *function = find_function(state, callee);
-    if (function == NULL) {
-        fail(state, expression->position, "undefined function '%s'", callee);
+    bool is_method = false;
+    const char *callee = NULL;
+    if (!require_fallible_call(state, expression, &call, &is_method, &callee,
+                               expression->position)) {
         return false;
     }
 
-    const Decl *errors = function_error_set(state, function->declaration);
+    const Decl *errors = callee_error_set(state, callee, is_method);
     if (errors == NULL) {
         fail(state, expression->position, "'%s' cannot fail, so Catch has nothing to do",
              callee);
@@ -1702,12 +2118,19 @@ static bool evaluate_catch(InterpState *state, const Expr *expression, Scope *sc
             }
         }
 
-        /* The parser already rejected an arm that does not end with an
-         * expression, so this only fires if the grammar and this loop drift
+        /* The parser already rejected an arm that neither ends with an expression nor
+         * with Fail, so this only fires if the grammar and this loop drift
          * apart -- worth a message rather than a Nothing. */
         if (ok && !produced) {
+            if (state->propagation.propagating) {
+                /* `Fail` in an arm gives up and propagates. There is no value;
+                 * the statement-level guard sees the propagation and stops. */
+                scope_destroy(inner);
+                return true;
+            }
             fail(state, arm->position,
-                 "Catch arm '%s' must end with an expression", arm->variant);
+                 "Catch arm '%s' must end with an expression or with Fail",
+                 arm->variant);
             ok = false;
         }
         if (ok) *out = arm_value;
@@ -1818,6 +2241,9 @@ static bool evaluate(InterpState *state, const Expr *expression,
 
         case EXPR_CATCH:
             return evaluate_catch(state, expression, scope, out);
+
+        case EXPR_ALLOCATOR_NEW:
+            return evaluate_allocator_new(state, expression, scope, out);
 
         case EXPR_CALL:
             return evaluate_call(state, expression, scope, out);
@@ -2045,6 +2471,44 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             return true;
         }
 
+        case STMT_ALLOCATOR: {
+            /* Bind for the body, restore on every exit path.
+             *
+             * The restore is the whole point of Model C, and the exit paths are
+             * the risk the prototype document named. Normal exit, an early
+             * Return out of the enclosing function, and a propagating error all
+             * have to restore, or code after the block would allocate from an
+             * arena that is no longer current. */
+            Value bound;
+            if (!evaluate(state, statement->expression, scope, &bound)) return false;
+            if (bound.type != VALUE_ALLOCATOR) {
+                fail(state, statement->position,
+                     "an allocator block binds an Allocator, got %s",
+                     type_name_of(bound));
+                return false;
+            }
+
+            struct Allocator *previous = state->current_allocator;
+            state->current_allocator = bound.as.allocator;
+
+            Flow inner_flow = {0};
+            bool ok = execute_block(state, statement->body, statement->body_count,
+                                    scope, &inner_flow);
+
+            /* Restored before the result is reported, so that whatever the
+             * failure was, the binding is back to where it was. */
+            state->current_allocator = previous;
+            if (!ok) return false;
+
+            /* A Return or a propagation from inside the block belongs to the
+             * enclosing function, so it is forwarded rather than dropped. */
+            if (inner_flow.returned) {
+                flow->returned = true;
+                flow->return_value = inner_flow.return_value;
+            }
+            return true;
+        }
+
         case STMT_STRUCT:
         case STMT_UNION:
             /* Types are registered in a pre-pass, so reaching the declaration
@@ -2185,6 +2649,20 @@ static bool register_decl(InterpState *state, const Stmt *node) {
 }
 
 static bool hoist_decls(InterpState *state, const Program *program) {
+    /* The predeclared error set goes in first, so a user declaration naming it
+     * is a duplicate rather than a redefinition with different contents. */
+    if (state->decl_count + 1 > state->decl_capacity) {
+        size_t capacity = state->decl_capacity ? state->decl_capacity * 2 : 8;
+        Decl *grown = realloc(state->decls, capacity * sizeof(Decl));
+        if (grown == NULL) {
+            fail(state, memory_node.position, "out of memory");
+            return false;
+        }
+        state->decls = grown;
+        state->decl_capacity = capacity;
+    }
+    state->decls[state->decl_count++] = memory_decl;
+
     for (size_t i = 0; i < program->count; i++) {
         const Stmt *statement = program->statements[i];
         if (statement->type != STMT_STRUCT && statement->type != STMT_UNION) {
@@ -2227,6 +2705,9 @@ int interp_run(const Program *program, Interp *interp) {
         snprintf(interp->message, sizeof(interp->message), "%s", state.message);
         result = 1;
     }
+
+    for (size_t i = 0; i < state.allocator_count; i++) allocator_destroy(state.allocators[i]);
+    free(state.allocators);
 
     free(state.functions);
     scope_destroy_chain(state.global_scope);

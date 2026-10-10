@@ -63,6 +63,10 @@ typedef enum {
     TOKEN_CATCH,
     TOKEN_FAIL,
 
+    /* Allocators. A keyword because `Allocator(4096)` is a constructor, and a
+     * constructor spelled like a call needs the type name reserved. */
+    TOKEN_ALLOCATOR,
+
     /* Punctuation */
     TOKEN_LPAREN,
     TOKEN_RPAREN,

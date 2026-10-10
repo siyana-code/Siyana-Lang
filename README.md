@@ -135,8 +135,15 @@ union also has *no guaranteed byte layout* — on-disk and wire formats go
 through a `Struct`, whose layout is specified. See
 [decision 22](research/decisions.md).
 
-Deliberately **not** implemented yet: slices, modules, pointers, string
-concatenation, and the explicit allocator model.
+Deliberately **not** implemented yet: buffers, borrows, slices, modules,
+pointers, and string concatenation.
+
+**Allocation is explicit and failure is a value.** An `Allocator` owns a region;
+`Allocate` returns an offset into it and `OutOfMemory` is a normal error to
+handle. `allocator(x) { ... }` binds one for a block and restores the previous
+binding on every exit path — including error propagation, which is the case the
+model existed to get right. Deinit is explicit: the block frees nothing.
+See [decision 24](research/decisions.md).
 
 **Errors are values with declared sets.** `Try` propagates, `Catch` handles,
 `Fail` originates. A call that can fail must be handled where it is written,

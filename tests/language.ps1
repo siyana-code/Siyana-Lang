@@ -758,6 +758,156 @@ H();
     Test-Output $src @('one', 'two')
 }
 
+# --- Allocators -------------------------------------------------------------
+#
+# The exit criterion this phase exists for: allocation failure is a value, never
+# a crash. The restore tests matter as much -- an allocator block that fails to
+# restore on an exit path leaves code allocating into an arena that is no longer
+# current, which is silent corruption rather than a diagnostic.
+
+Test-Case 'an Allocator holds real bytes' {
+    $src = @'
+Variable arena: Allocator = Allocator(32);
+Variable at: Word = arena.Allocate(8) Catch { OutOfMemory { 0; } };
+arena.Store(at, 65);
+arena.Store(at + 1, 66);
+Terminal.Write(arena.Load(at));
+Terminal.Write(arena.Load(at + 1));
+Terminal.Write(arena.Used());
+Terminal.Write(arena.Capacity());
+'@
+    Test-Output $src @('A', 'B', '8', '32')
+}
+Test-Case 'allocation failure is a value, not a crash' {
+    $src = @'
+Variable arena: Allocator = Allocator(16);
+Variable tooBig: Word = arena.Allocate(4096) Catch {
+    OutOfMemory {
+        Terminal.Write("did not fit");
+        0;
+    }
+};
+Terminal.Write(tooBig);
+'@
+    Test-Output $src @('did not fit', '0')
+}
+Test-Case 'an exhausted allocator is still usable' {
+    # Exhaustion must not corrupt the arena. A bump allocator that returned
+    # garbage on the next call would hand out the same offset twice.
+    $src = @'
+Variable arena: Allocator = Allocator(16);
+Variable a: Word = arena.Allocate(8) Catch { OutOfMemory { 0; } };
+Variable b: Word = arena.Allocate(8) Catch { OutOfMemory { 0; } };
+Variable c: Word = arena.Allocate(4096) Catch { OutOfMemory { 999; } };
+Variable d: Word = arena.Allocate(8) Catch { OutOfMemory { 999; } };
+Terminal.Write(a);
+Terminal.Write(b);
+Terminal.Write(c);
+Terminal.Write(d);
+'@
+    Test-Output $src @('0', '8', '999', '999')
+}
+Test-Case 'the block binds the allocator' {
+    # The whole point: an ambient Allocate goes to the arena the block named,
+    # and nowhere else.
+    $src = @'
+Variable outer: Allocator = Allocator(64);
+Variable scratch: Allocator = Allocator(16);
+allocator(scratch) {
+    Variable p: Word = Allocate(8) Catch { OutOfMemory { Fail OutOfMemory; } };
+    Terminal.Write(scratch.Used());
+    Terminal.Write(outer.Used());
+}
+'@
+    Test-Output $src @('8', '0')
+}
+Test-Case 'nesting restores the right allocator' {
+    $src = @'
+Variable outer: Allocator = Allocator(64);
+Variable inner: Allocator = Allocator(16);
+allocator(outer) {
+    Variable p: Word = Allocate(4) Catch { OutOfMemory { Fail OutOfMemory; } };
+    allocator(inner) {
+        Variable q: Word = Allocate(4) Catch { OutOfMemory { Fail OutOfMemory; } };
+        Terminal.Write(inner.Used());
+    }
+    Terminal.Write(outer.Used());
+}
+'@
+    Test-Output $src @('4', '4')
+}
+Test-Case 'a Return out of the block restores the binding' {
+    # Unobservable from inside the function, so checked from outside: after the
+    # call, an ambient Allocate must find no binding. If the restore were
+    # skipped, it would allocate into an arena whose call frame is gone.
+    $src = @'
+Function Escape() -> Word {
+    Variable here: Allocator = Allocator(8);
+    allocator(here) {
+        Variable p: Word = Allocate(4) Catch { OutOfMemory { Fail OutOfMemory; } };
+        Return here.Used();
+    }
+    Return 0;
+}
+Terminal.Write(Escape());
+Variable after: Word = Allocate(4) Catch { OutOfMemory { 0; } };
+'@
+    Test-Diagnostic $src 'no allocator is bound'
+}
+Test-Case 'an error propagating out of the block restores the binding' {
+    $src = @'
+Function PropagateOut() -> Result{Word, Memory} {
+    Variable a: Allocator = Allocator(16);
+    allocator(a) {
+        Variable p: Word = Allocate(4) Catch { OutOfMemory { Fail OutOfMemory; } };
+        Fail OutOfMemory;
+    }
+    Return 0;
+}
+Variable handled: Word = PropagateOut() Catch { OutOfMemory { 7; } };
+Terminal.Write(handled);
+Variable after: Word = Allocate(4) Catch { OutOfMemory { 0; } };
+'@
+    Test-Diagnostic $src 'no allocator is bound'
+}
+Test-Case 'a propagated OutOfMemory is still catchable outside the block' {
+    $src = @'
+Function PropagateOut() -> Result{Word, Memory} {
+    Variable a: Allocator = Allocator(16);
+    allocator(a) {
+        Variable p: Word = Allocate(4) Catch { OutOfMemory { Fail OutOfMemory; } };
+        Fail OutOfMemory;
+    }
+    Return 0;
+}
+Variable handled: Word = PropagateOut() Catch { OutOfMemory { 7; } };
+Terminal.Write(handled);
+'@
+    Test-Output $src @('7')
+}
+Test-Case 'an ambient Allocate with no binding is an error' {
+    Test-Diagnostic 'Variable p: Word = Allocate(4) Catch { OutOfMemory { 0; } };' 'no allocator is bound'
+}
+Test-Case 'an Allocator may not be redeclared as an error set' {
+    # Memory is predeclared, so a program cannot redefine OutOfMemory with
+    # different contents and have Allocate silently mean something else.
+    Test-Diagnostic 'Error Memory { OutOfMemory, }' 'already declared'
+}
+Test-Case 'Store and Load reject an out-of-range offset' {
+    # A bug rather than an allocation failure, so it stops rather than becoming
+    # a value to check. A kernel reading the wrong frame should not go on.
+    Test-Diagnostic 'Variable a: Allocator = Allocator(16); Variable p: Word = a.Allocate(4) Catch { OutOfMemory { 0; } }; Terminal.Write(a.Load(p + 100));' "outside this Allocator"
+}
+Test-Case 'an Allocator capacity of zero is an error' {
+    Test-Diagnostic 'Variable a: Allocator = Allocator(0);' 'greater than zero'
+}
+Test-Case 'an unhandled allocation is an error' {
+    Test-Diagnostic 'Variable a: Allocator = Allocator(16); Variable p: Word = a.Allocate(4);' 'can fail; follow the call with Try or Catch'
+}
+Test-Case 'an unknown Allocator method is an error' {
+    Test-Diagnostic 'Variable a: Allocator = Allocator(16); Terminal.Write(a.Nonsense());' "no method 'Nonsense'"
+}
+
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {
