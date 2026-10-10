@@ -4,13 +4,12 @@
 
 .DESCRIPTION
     Each case runs a small program and checks its output or its diagnostics.
-    These are the Phase 2 exit criteria from docs/architecture.md:
 
-      - siyana run hello.sy prints output
-      - a failing parse reports line and column
-      - a runtime type error names the offending expression
+    Covers the Phase 3 language: Number and Character as the only primitives,
+    full-name keywords, Terminal as a value with Write and ReadLine, and
+    C-style truthiness per decision 17.
 
-    Written as data rather than code so adding a case is one line, and so the
+    Written as data where possible so adding a case is one line, and so the
     full language slice is visible in one place when reviewing coverage.
 
 .EXAMPLE
@@ -35,40 +34,38 @@ $script:Total = 0
 $script:TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("siyana-tests-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $script:TempDir | Out-Null
 
-function Invoke-Si([string[]]$SiArgs) {
+function Invoke-Si([string[]]$SiArgs, [string]$Stdin = '') {
     <#
       Runs the binary and captures stdout and stderr together.
 
       PowerShell wraps native stderr in an ErrorRecord, which re-formats the
       text and inserts line breaks mid-message. Comparing against that is
-      fragile, so the raw streams are captured with .NET instead: the output
-      stays byte-faithful and patterns can match it directly.
+      fragile, so the raw streams are captured with .NET instead.
+
+      `Arguments` is used rather than `ArgumentList`, which is .NET Core only;
+      this must also run on Windows PowerShell 5.1.
     #>
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $psi = [System.Diagnostics.ProcessStartInfo]::new()
-        $psi.FileName = $script:ExePath
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        # `Arguments` rather than `ArgumentList`: the latter is .NET Core only,
-        # and this must also run on Windows PowerShell 5.1.
-        $psi.Arguments = ($SiArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $script:ExePath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # Redirected so stdin can be supplied and then closed. Without this,
+    # StandardInput is null and a program reading input would hang on a
+    # terminal rather than seeing end of input.
+    $psi.RedirectStandardInput = $true
+    $psi.Arguments = ($SiArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
 
-        $process = [System.Diagnostics.Process]::Start($psi)
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+    $process = [System.Diagnostics.Process]::Start($psi)
+    if ($Stdin) { $process.StandardInput.Write($Stdin) }
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
 
-        $code = $process.ExitCode
-        # stderr first: diagnostics go there, and putting them first keeps them
-        # adjacent in the captured text.
-        $out = ($stderr + $stdout)
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    return @{ Code = $code; Out = $out }
+    # stderr first: diagnostics go there, and keeping them adjacent in the
+    # captured text makes failures easier to read.
+    return @{ Code = $process.ExitCode; Out = ($stderr + $stdout) }
 }
 
 function Test-Case([string]$Name, [scriptblock]$Body) {
@@ -84,11 +81,11 @@ function Test-Case([string]$Name, [scriptblock]$Body) {
 }
 
 # Runs a program and asserts it succeeds and prints exactly the expected lines.
-function Test-Output([string]$Source, [string[]]$Expected) {
-    $file = Join-Path $script:TempDir ("case-{0}.sy" -f [guid]::NewGuid())
+function Test-Output([string]$Source, [string[]]$Expected, [string]$Stdin = '') {
+    $file = Join-Path $script:TempDir ("case-{0}.sl" -f [guid]::NewGuid())
     $Source | Out-File -Encoding ascii $file
     try {
-        $r = Invoke-Si @('run', $file)
+        $r = Invoke-Si @('run', $file) $Stdin
         if ($r.Code -ne 0) { throw "expected success, got exit $($r.Code): $($r.Out)" }
         $actual = @($r.Out -split "`r?`n" | Where-Object { $_ -ne '' })
         if ($actual.Count -ne $Expected.Count) {
@@ -104,19 +101,16 @@ function Test-Output([string]$Source, [string[]]$Expected) {
     }
 }
 
-# Like Test-Output but counts an empty output line as a real line.
-#
-# The standard helper filters blank lines, which is right for nearly every case
-# but wrong for print(""): that prints one empty line, and filtering it would
-# make the test pass for the wrong reason.
+# Like Test-Output but counts an empty output line as a real line. Test-Output
+# filters blanks, which is right almost everywhere but wrong for a program
+# whose only output is an empty line -- it would pass for the wrong reason.
 function Test-OutputRaw([string]$Source, [string[]]$Expected) {
-    $file = Join-Path $script:TempDir ("case-{0}.sy" -f [guid]::NewGuid())
+    $file = Join-Path $script:TempDir ("case-{0}.sl" -f [guid]::NewGuid())
     $Source | Out-File -Encoding ascii $file
     try {
         $r = Invoke-Si @('run', $file)
         if ($r.Code -ne 0) { throw "expected success, got exit $($r.Code): $($r.Out)" }
         $lines = @($r.Out -split "`r?`n")
-        # PowerShell keeps a trailing empty entry from the final newline.
         if ($lines.Count -gt 0 -and $lines[-1] -eq '') { $lines = $lines[0..($lines.Count - 2)] }
         if ($lines.Count -ne $Expected.Count) {
             throw "expected $($Expected.Count) line(s) [$($Expected -join ', ')], got $($lines.Count) [$($lines -join ', ')]"
@@ -133,7 +127,7 @@ function Test-OutputRaw([string]$Source, [string[]]$Expected) {
 
 # Runs a program and asserts it fails with a diagnostic matching the pattern.
 function Test-Diagnostic([string]$Source, [string]$Pattern) {
-    $file = Join-Path $script:TempDir ("case-{0}.sy" -f [guid]::NewGuid())
+    $file = Join-Path $script:TempDir ("case-{0}.sl" -f [guid]::NewGuid())
     $Source | Out-File -Encoding ascii $file
     try {
         $r = Invoke-Si @('run', $file)
@@ -148,136 +142,196 @@ function Test-Diagnostic([string]$Source, [string]$Pattern) {
 
 Write-Host 'running language tests'
 
-# --- Literals and printing --------------------------------------------------
+# --- Terminal ---------------------------------------------------------------
 
-Test-Case 'prints a string'          { Test-Output 'print("hello");' @('hello') }
-Test-Case 'prints an integer'        { Test-Output 'print(42);' @('42') }
-Test-Case 'prints a negative integer' { Test-Output 'print(-7);' @('-7') }
-Test-Case 'prints true and false'    { Test-Output 'print(true); print(false);' @('true', 'false') }
-Test-Case 'prints an empty string'   { Test-OutputRaw 'print("");' @('') }
+Test-Case 'Terminal.Write prints a string' { Test-Output 'Terminal.Write("hello");' @('hello') }
+Test-Case 'Terminal.Write prints a Number' { Test-Output 'Terminal.Write(42);' @('42') }
+Test-Case 'Terminal.Write appends a newline' { Test-OutputRaw 'Terminal.Write("x");' @('x') }
+Test-Case 'Terminal.Write prints True and False' {
+    Test-Output 'Terminal.Write(True); Terminal.Write(False);' @('True', 'False')
+}
+Test-Case 'Terminal.Write an empty string' { Test-OutputRaw 'Terminal.Write("");' @('') }
+Test-Case 'Terminal.ReadLine reads a line' {
+    Test-Output 'Variable line: Number = 0; Terminal.Write(1);' @('1') "typed input`n"
+}
+
+# --- Literals and types -----------------------------------------------------
+
+Test-Case 'Number literal'            { Test-Output 'Terminal.Write(7);' @('7') }
+Test-Case 'negative Number'           { Test-Output 'Terminal.Write(-7);' @('-7') }
+Test-Case 'Character literal'         { Test-Output "Terminal.Write('A');" @('A') }
+Test-Case 'Character escape'          { Test-Output "Terminal.Write('\n');" @() }
+Test-Case 'String literal'            { Test-Output 'Terminal.Write("text");' @('text') }
 
 # --- Arithmetic -------------------------------------------------------------
 
-Test-Case 'addition'        { Test-Output 'print(2 + 3);' @('5') }
-Test-Case 'subtraction'     { Test-Output 'print(9 - 4);' @('5') }
-Test-Case 'multiplication'  { Test-Output 'print(6 * 7);' @('42') }
-Test-Case 'division'        { Test-Output 'print(20 / 4);' @('5') }
-Test-Case 'unary negation'  { Test-Output 'print(-(3 + 4));' @('-7') }
-Test-Case 'precedence: * before +'   { Test-Output 'print(2 + 3 * 4);' @('14') }
-Test-Case 'precedence: parens'       { Test-Output 'print((2 + 3) * 4);' @('20') }
-Test-Case 'left associativity'       { Test-Output 'print(10 - 3 - 2);' @('5') }
+Test-Case 'addition'       { Test-Output 'Terminal.Write(2 + 3);' @('5') }
+Test-Case 'subtraction'    { Test-Output 'Terminal.Write(9 - 4);' @('5') }
+Test-Case 'multiplication' { Test-Output 'Terminal.Write(6 * 7);' @('42') }
+Test-Case 'division'       { Test-Output 'Terminal.Write(20 / 4);' @('5') }
+Test-Case 'unary negation' { Test-Output 'Terminal.Write(-(3 + 4));' @('-7') }
+Test-Case 'precedence: * before +' { Test-Output 'Terminal.Write(2 + 3 * 4);' @('14') }
+Test-Case 'precedence: parens'     { Test-Output 'Terminal.Write((2 + 3) * 4);' @('20') }
+Test-Case 'left associativity'     { Test-Output 'Terminal.Write(10 - 3 - 2);' @('5') }
 Test-Case 'division by zero is an error' {
-    Test-Diagnostic 'print(1 / 0);' 'division by zero'
+    Test-Diagnostic 'Terminal.Write(1 / 0);' 'division by zero'
 }
 
-# --- Comparison and logic ---------------------------------------------------
+# --- Comparison -------------------------------------------------------------
 
-Test-Case 'equality'          { Test-Output 'print(3 == 3);' @('true') }
-Test-Case 'inequality'        { Test-Output 'print(3 != 3);' @('false') }
-Test-Case 'less than'         { Test-Output 'print(2 < 5);' @('true') }
-Test-Case 'less or equal'     { Test-Output 'print(5 <= 5);' @('true') }
-Test-Case 'greater than'      { Test-Output 'print(9 > 2);' @('true') }
-Test-Case 'greater or equal'  { Test-Output 'print(2 >= 9);' @('false') }
-Test-Case 'logical not'       { Test-Output 'print(!false);' @('true') }
-Test-Case 'double negation'   { Test-Output 'print(!!true);' @('true') }
+Test-Case 'equality'    { Test-Output 'Terminal.Write(3 == 3);' @('True') }
+Test-Case 'inequality'  { Test-Output 'Terminal.Write(3 != 3);' @('False') }
+Test-Case 'less than'   { Test-Output 'Terminal.Write(2 < 5);' @('True') }
+Test-Case 'less equal'  { Test-Output 'Terminal.Write(5 <= 5);' @('True') }
+Test-Case 'greater'     { Test-Output 'Terminal.Write(9 > 2);' @('True') }
+Test-Case 'greater eq'  { Test-Output 'Terminal.Write(2 >= 9);' @('False') }
+Test-Case 'Character equality' { Test-Output "Terminal.Write('a' == 'a');" @('True') }
 Test-Case 'string equality compares contents' {
-    Test-Output 'print("ab" == "ab"); print("ab" == "ac");' @('true', 'false')
+    Test-Output 'Terminal.Write("ab" == "ab"); Terminal.Write("ab" == "ac");' @('True', 'False')
+}
+Test-Case 'Number and Character never mix' {
+    Test-Diagnostic "Terminal.Write(1 == 'a');" 'cannot compare'
+}
+
+# --- C-style truthiness (decision 17) ---------------------------------------
+
+Test-Case 'not of True is False'  { Test-Output 'Terminal.Write(!True);' @('False') }
+Test-Case 'not of False is True'  { Test-Output 'Terminal.Write(!False);' @('True') }
+Test-Case 'If (1) is True'         { Test-Output 'If (1) { Terminal.Write("yes"); }' @('yes') }
+Test-Case 'If (0) is False'        { Test-Output 'If (0) { Terminal.Write("yes"); } Else { Terminal.Write("no"); }' @('no') }
+Test-Case 'If (42) is True'        { Test-Output 'If (42) { Terminal.Write("yes"); }' @('yes') }
+Test-Case 'Loop (0) does not run'  { Test-Output 'Loop (0) { Terminal.Write("x"); }' @() }
+Test-Case 'If on a String is an error' {
+    Test-Diagnostic 'If ("x") { }' "condition of 'If' must be Number or Character"
 }
 
 # --- Variables --------------------------------------------------------------
 
 Test-Case 'declare and print' {
-    Test-Output 'var x: int = 5; print(x);' @('5')
+    Test-Output 'Variable x: Number = 5; Terminal.Write(x);' @('5')
+}
+Test-Case 'declare a Character' {
+    Test-Output "Variable c: Character = 'z'; Terminal.Write(c);" @('z')
 }
 Test-Case 'reassignment' {
-    Test-Output 'var x: int = 5; x = 9; print(x);' @('9')
+    Test-Output 'Variable x: Number = 5; x = 9; Terminal.Write(x);' @('9')
 }
-Test-Case 'undeclared variable is an error' {
-    Test-Diagnostic 'print(nope);' "undefined variable 'nope'"
+Test-Case 'undefined variable is an error' {
+    Test-Diagnostic 'Terminal.Write(nope);' "undefined variable 'nope'"
 }
-Test-Case 'type mismatch on initialiser is an error' {
-    Test-Diagnostic 'var x: int = true;' 'cannot initialise'
+Test-Case 'Number cannot hold a Character' {
+    Test-Diagnostic "Variable x: Number = 'a';" 'cannot initialise'
+}
+Test-Case 'Character cannot hold a Number' {
+    Test-Diagnostic 'Variable c: Character = 65;' 'cannot initialise'
 }
 Test-Case 'duplicate declaration is an error' {
-    Test-Diagnostic 'var x: int = 1; var x: int = 2;' 'already declared'
+    Test-Diagnostic 'Variable x: Number = 1; Variable x: Number = 2;' 'already declared'
 }
 
 # --- Control flow -----------------------------------------------------------
 
-Test-Case 'if takes the true branch' {
-    Test-Output 'if (1 < 2) { print(1); } else { print(2); }' @('1')
+Test-Case 'If takes the true branch' {
+    Test-Output 'If (1 < 2) { Terminal.Write(1); } Else { Terminal.Write(2); }' @('1')
 }
-Test-Case 'if takes the else branch' {
-    Test-Output 'if (2 < 1) { print(1); } else { print(2); }' @('2')
+Test-Case 'If takes the else branch' {
+    Test-Output 'If (2 < 1) { Terminal.Write(1); } Else { Terminal.Write(2); }' @('2')
 }
-Test-Case 'if without else and a false condition prints nothing' {
-    Test-Output 'if (false) { print(1); }' @()
+Test-Case 'If without Else and false prints nothing' {
+    Test-Output 'If (0) { Terminal.Write(1); }' @()
 }
-Test-Case 'while loop' {
-    Test-Output 'var i: int = 0; while (i < 3) { print(i); i = i + 1; }' @('0', '1', '2')
+Test-Case 'Else If chain picks the middle' {
+    Test-Output 'If (0) { Terminal.Write(1); } Else If (1) { Terminal.Write(2); } Else { Terminal.Write(3); }' @('2')
 }
-Test-Case 'non-bool condition is an error' {
-    Test-Diagnostic 'if (1) { print(1); }' 'condition of ''if'' must be bool'
+Test-Case 'Else If chain falls through to Else' {
+    Test-Output 'If (0) { Terminal.Write(1); } Else If (0) { Terminal.Write(2); } Else { Terminal.Write(3); }' @('3')
+}
+Test-Case 'Loop iterates' {
+    Test-Output 'Variable i: Number = 0; Loop (i < 3) { Terminal.Write(i); i = i + 1; }' @('0', '1', '2')
+}
+Test-Case 'nested Loop' {
+    Test-Output @'
+Variable i: Number = 0;
+Loop (i < 2) {
+    Variable j: Number = 0;
+    Loop (j < 2) { Terminal.Write(i * 2 + j); j = j + 1; }
+    i = i + 1;
+}
+'@ @('0', '1', '2', '3')
 }
 
 # --- Functions --------------------------------------------------------------
 
-Test-Case 'function call with no arguments' {
-    Test-Output 'fn greet() { print("hi"); } greet();' @('hi')
+Test-Case 'Function with no arguments' {
+    Test-Output 'Function Greet() { Terminal.Write("hi"); } Greet();' @('hi')
 }
-Test-Case 'function with a parameter' {
-    Test-Output 'fn show(a: int) { print(a); } show(7);' @('7')
+Test-Case 'Function with a parameter' {
+    Test-Output 'Function Show(a: Number) { Terminal.Write(a); } Show(7);' @('7')
 }
-Test-Case 'function with two parameters' {
-    Test-Output 'fn add(a: int, b: int) { print(a + b); } add(2, 3);' @('5')
+Test-Case 'Function with two parameters' {
+    Test-Output 'Function Add(a: Number, b: Number) { Terminal.Write(a + b); } Add(2, 3);' @('5')
 }
-Test-Case 'recursive factorial' {
-    Test-Output 'fn fact(n: int) { if (n <= 1) { return 1; } return n * fact(n - 1); } print(fact(5));' @('120')
+Test-Case 'Function with a Character parameter' {
+    Test-Output "Function Show(a: Character) { Terminal.Write(a); } Show('q');" @('q')
 }
-Test-Case 'functions may be declared after use' {
-    Test-Output 'main_helper(); fn main_helper() { print("later"); }' @('later')
+Test-Case 'Function with a declared return type' {
+    Test-Output 'Function Double(a: Number) -> Number { Return a * 2; } Terminal.Write(Double(4));' @('8')
+}
+Test-Case 'recursion' {
+    Test-Output 'Function Fact(n: Number) -> Number { If (n <= 1) { Return 1; } Return n * Fact(n - 1); } Terminal.Write(Fact(5));' @('120')
+}
+Test-Case 'Function may be declared after use' {
+    Test-Output 'Later(); Function Later() { Terminal.Write("later"); }' @('later')
 }
 Test-Case 'undefined function is an error' {
-    Test-Diagnostic 'nothere();' "undefined function 'nothere'"
+    Test-Diagnostic 'Nope();' "undefined function 'Nope'"
 }
 Test-Case 'wrong argument count is an error' {
-    Test-Diagnostic 'fn f(a: int) { } f(1, 2);' 'expects 1 argument'
+    Test-Diagnostic 'Function F(a: Number) { } F(1, 2);' 'expects 1 argument'
+}
+Test-Case 'True is acceptable where Number is expected' {
+    # Expected, not a bug: True is Number 1 (decision 17), so passing it to a
+    # Number parameter is correct. This test exists so that the consequence is
+    # pinned down rather than discovered later as a surprise.
+    Test-Output 'Function F(a: Number) { Terminal.Write(a); } F(True);' @('1')
 }
 Test-Case 'wrong argument type is an error' {
-    Test-Diagnostic 'fn f(a: int) { } f(true);' "parameter 'a'.*expects int"
+    # Character is the distinct primitive, so passing one to a Number
+    # parameter must fail.
+    Test-Diagnostic "Function F(a: Number) { } F('c');" "parameter 'a'.*expects Number"
+}
+Test-Case 'unknown type is an error' {
+    Test-Diagnostic 'Variable x: Widget = 1;' "expected type 'Number' or 'Character'"
 }
 
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {
-    Test-Output "// a comment`nprint(1); // trailing" @('1')
+    Test-Output "// a comment`nTerminal.Write(1); // trailing" @('1')
 }
 Test-Case 'block comments are ignored' {
-    Test-Output "/* a`n   block comment */`nprint(1);" @('1')
+    Test-Output "/* a`n   block comment */`nTerminal.Write(1);" @('1')
 }
 
-# --- Diagnostics: parse errors report line and column ------------------------
+# --- Diagnostics ------------------------------------------------------------
 
-Test-Case 'missing semicolon reports line and column' {
-    # Out-File appends a trailing newline, so the failure surfaces as
-    # "found end of file" on line 2. The position is still tracked, which is
-    # what this asserts.
-    Test-Diagnostic 'print(1)' '\.sy:2:1: error: expected'
-}
-# Assigned to a variable first rather than passed as an inline literal: a `{`
-# inside a scriptblock argument confuses how PowerShell parses the enclosing
-# brace, so the case name was being written to the source file instead.
-$unclosedBlock = 'if (true) { print(1);'
-Test-Case 'unclosed brace is reported' {
-    Test-Diagnostic $script:unclosedBlock 'unclosed'
-}
 # Source fragments containing braces or quotes are held in variables first.
 # Passed inline they confuse how PowerShell parses the enclosing scriptblock,
 # and the case name ends up in the source file instead of the program.
-$unterminatedString = 'print("abc);'
+$unclosedBlock = 'If (True) { Terminal.Write(1);'
+$unterminatedString = 'Terminal.Write("abc);'
 $unterminatedComment = '/* nope'
-$unexpectedCharacter = 'print(#);'
+$unexpectedCharacter = 'Terminal.Write(#);'
+$unknownMethod = 'Terminal.Frob(1);'
+$emptyCharacter = "Terminal.Write('');"
+$longCharacter = "Terminal.Write('ab');"
 
+Test-Case 'missing semicolon reports line and column' {
+    Test-Diagnostic 'Terminal.Write(1)' '\.sl:2:1: error: expected'
+}
+Test-Case 'unclosed brace is reported' {
+    Test-Diagnostic $script:unclosedBlock 'unclosed'
+}
 Test-Case 'unterminated string is reported' {
     Test-Diagnostic $script:unterminatedString 'unterminated string'
 }
@@ -287,21 +341,14 @@ Test-Case 'unterminated block comment is reported' {
 Test-Case 'unexpected character is reported' {
     Test-Diagnostic $script:unexpectedCharacter 'unexpected character'
 }
-
-# --- Diagnostics: the error names the offending expression -------------------
-
-$compareMismatch = 'print(1 == "a");'
-$badOperand = 'print(true + 1);'
-$notNonBool = 'print(!1);'
-
-Test-Case 'mismatched comparison names both types' {
-    Test-Diagnostic $script:compareMismatch 'cannot compare int with string'
+Test-Case 'unknown Terminal method is reported' {
+    Test-Diagnostic $script:unknownMethod "expected 'Write' or 'ReadLine'"
 }
-Test-Case 'bad operand type names the operator' {
-    Test-Diagnostic $script:badOperand 'requires int operands'
+Test-Case 'empty character literal is reported' {
+    Test-Diagnostic $script:emptyCharacter 'empty character literal'
 }
-Test-Case 'non-bool operand to ! is reported' {
-    Test-Diagnostic $script:notNonBool 'requires a bool'
+Test-Case 'multi-byte character literal is rejected' {
+    Test-Diagnostic $script:longCharacter 'more than one byte'
 }
 
 # --- Report -----------------------------------------------------------------

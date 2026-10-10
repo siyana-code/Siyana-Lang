@@ -1,8 +1,7 @@
 /* token.h -- lexical tokens for Siyana Lang.
  *
- * Phase 2 slice: integers, bool, string literals, identifiers, the operators
- * needed for arithmetic and comparison, and the keywords for the statement
- * forms. See docs/architecture.md for the full feature set.
+ * Keywords are spelled out in full (decision 16): `If`, `Loop`, `Function`.
+ * They cannot collide with user identifiers, and `grep Loop` finds every loop.
  */
 
 #ifndef SIYANA_TOKEN_H
@@ -19,27 +18,33 @@ typedef enum {
 
     /* Literals */
     TOKEN_IDENT,
-    TOKEN_INT,
+    TOKEN_NUMBER,
+    TOKEN_CHARACTER,
     TOKEN_STRING,
 
-    /* Keywords */
-    TOKEN_FN,
-    TOKEN_VAR,
-    TOKEN_RETURN,
+    /* Types */
+    TOKEN_NUMBER_TYPE,
+    TOKEN_CHARACTER_TYPE,
+
+    /* Declarations */
+    TOKEN_VARIABLE,
+    TOKEN_FUNCTION,
+
+    /* Control flow */
     TOKEN_IF,
     TOKEN_ELSE,
-    TOKEN_WHILE,
+    TOKEN_LOOP,
+    TOKEN_RETURN,
+
+    /* Boolean literals, derived from Number (decision 17) */
     TOKEN_TRUE,
     TOKEN_FALSE,
-    TOKEN_BOOL,
-    TOKEN_INT_TYPE,
 
-    /* Builtins.
-     *
-     * Builtins are keywords rather than ordinary identifiers so a call to one
-     * is visible in the token stream and can be diagnosed as such. Phase 5
-     * replaces this with a proper namespace, and the grammar changes then. */
-    TOKEN_PRINT,
+    /* Builtins. Terminal is a value, not a module, so that it can later be
+     * passed and stored like any other object. */
+    TOKEN_TERMINAL,
+    TOKEN_WRITE,
+    TOKEN_READ_LINE,
 
     /* Punctuation */
     TOKEN_LPAREN,
@@ -49,6 +54,7 @@ typedef enum {
     TOKEN_COMMA,
     TOKEN_SEMICOLON,
     TOKEN_COLON,
+    TOKEN_DOT,
 
     /* Operators */
     TOKEN_PLUS,
@@ -79,8 +85,8 @@ typedef struct {
      * start_offset + length). */
     size_t start_offset;
     size_t length;
-    /* Owned by the lexer; valid for the life of the token array. NULL for
-     * tokens with no literal payload. */
+    /* Owned by the lexer; valid for the life of the token array. Set for
+     * TOKEN_IDENT, TOKEN_NUMBER, TOKEN_CHARACTER, and TOKEN_STRING. */
     char *text;
 } Token;
 
