@@ -1,0 +1,58 @@
+// examples/tour.sy -- a tour of everything implemented in Phase 2.
+//
+// Run with: siyana run examples/tour.sy
+
+fn fib(n: int) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn greet(times: int) {
+    var i: int = 0;
+    while (i < times) {
+        print("hello");
+        i = i + 1;
+    }
+}
+
+fn describe(n: int) {
+    if (n < 0) {
+        print("negative");
+    } else if (n == 0) {
+        print("zero");
+    } else {
+        print("positive");
+    }
+}
+
+print("--- literals ---");
+print(42);
+print(-7);
+print(true);
+print("a string");
+
+print("--- arithmetic ---");
+print(2 + 3 * 4);
+print((2 + 3) * 4);
+print(17 / 5);
+
+print("--- comparison ---");
+print(3 == 3);
+print(3 != 3);
+print(2 < 5);
+print(5 >= 5);
+print("ab" == "ab");
+
+print("--- variables ---");
+var count: int = 3;
+count = count + 1;
+print(count);
+
+print("--- functions ---");
+greet(2);
+print(fib(10));
+describe(0);
+describe(-4);
+describe(9);

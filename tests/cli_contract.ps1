@@ -95,12 +95,29 @@ Test-Case 'unknown option exits non-zero' {
     if ($r.Out -notmatch 'unknown option') { throw "unexpected message: $($r.Out)" }
 }
 
-Test-Case 'source file reports not-yet-implemented rather than crashing' {
-    # A missing file must not read as a crash or a silent success. Phase 2
-    # changes this behaviour, and the test changes with it.
-    $r = Invoke-Si @('hello.sy')
+Test-Case 'a valid program runs and exits zero' {
+    # Phase 2 implements the interpreter, so a valid program runs.
+    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("siyana-cli-{0}.sy" -f [guid]::NewGuid())
+    'print("ok");' | Out-File -Encoding ascii $file
+    try {
+        $r = Invoke-Si @('run', $file)
+        if ($r.Code -ne 0) { throw "exit code $($r.Code): $($r.Out)" }
+        if ($r.Out -notmatch 'ok') { throw "no output: $($r.Out)" }
+    } finally {
+        Remove-Item $file -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'missing file exits non-zero with a clear message' {
+    $r = Invoke-Si @('run', 'does-not-exist.sy')
     if ($r.Code -eq 0) { throw 'expected non-zero exit' }
-    if ($r.Out -notmatch 'not implemented') { throw "unexpected message: $($r.Out)" }
+    if ($r.Out -notmatch 'cannot open') { throw "unexpected message: $($r.Out)" }
+}
+
+Test-Case 'run without a file exits non-zero' {
+    $r = Invoke-Si @('run')
+    if ($r.Code -eq 0) { throw 'expected non-zero exit' }
+    if ($r.Out -notmatch 'needs a source file') { throw "unexpected message: $($r.Out)" }
 }
 
 Write-Host ''

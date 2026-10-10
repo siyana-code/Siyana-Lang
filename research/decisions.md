@@ -18,6 +18,9 @@ worth more than a clean-looking list.
 | 5 | Audience: solo maintainer, no stability promise | Settled | 2026-10-10 |
 | 6 | Language scope: defined by a kernel-ready feature set | Settled | 2026-10-10 |
 | 7 | Host language for the bootstrap interpreter: C | Settled | 2026-10-10 |
+| 10 | Source file extension: `.sy` | Settled | 2026-10-10 |
+| 11 | Comments: `//` and `/* */` | Settled | 2026-10-10 |
+| 12 | Grammar shape: braces and semicolons, C-shaped | Settled | 2026-10-10 |
 
 ---
 
@@ -132,6 +135,62 @@ for it.
 **Note.** This is the language used to *build* Siyana Lang. It is not a
 recommendation about Siyana Lang itself, and it is not a constraint on the
 design — only on the bootstrap path.
+
+## 10. Source file extension: `.sy`
+
+**Decision.** Siyana Lang source files use `.sy`.
+
+**Reasoning.** Short, unambiguous, and does not collide with any existing
+language. Made before the standard library exists, so no migration cost.
+
+## 11. Comments: `//` and `/* */`
+
+**Decision.** Both forms, matching C.
+
+**Reasoning.** The author learned C first, and `//` is near-universal in modern
+languages. Supporting only one form would be a restriction with no benefit;
+supporting both is a small lexer change.
+
+## 12. Grammar shape: braces and semicolons
+
+**Decision.** Statement blocks use `{}`, statements terminate with `;`.
+
+**Reasoning.** This is the single most consequential "feel" decision, and it
+was made deliberately at the start rather than by accident.
+
+**Arguments for.** Familiar to anyone who has written C, C++, Java, C#, Go,
+Rust, Swift, or Zig. Error messages reference line and column, which only works
+predictably when statement boundaries are unambiguous. The team that will read
+this language is not hypothetical — it starts with one person who learned C.
+
+**Arguments against, recorded honestly.** Real indentation-based syntax is
+better in ways that matter: it removes the `;` requirement, it makes
+misalignment visible, and it encourages consistent structure. Swift, Kotlin,
+Nim, and Haskell all chose it. It is plausible that Siyana Lang would be better
+with it.
+
+**Deferral, not endorsement.** This decision is cheap to revisit now and
+expensive to revisit after the standard library ships. It should be revisited
+before Phase 3, while the language is still small enough that changing it costs
+nothing. The cost of switching later grows with every line of code written.
+
+**Note.** This is not a claim that braces are better. It is a claim about what
+to do first, and an acknowledgement that the question is open.
+
+## 13. Phase 2 language slice
+
+**Decision.** Phase 2 implements only: integer literals, `bool`, arithmetic,
+comparison, `if`/`else`, `while`, functions, `return`, and variables.
+
+**Reasoning.** The purpose of Phase 2 is to prove the lexer → parser →
+evaluator pipeline end to end on a language small enough that no design
+argument is required. Adding features during this phase defeats that purpose.
+
+**Noted gap.** The exit criterion "`siyana run hello.sy` prints output" implies
+string literals, which are technically outside this slice. They are included
+because an interpreter that cannot print text has not demonstrated a useful
+capability, and because the diagnostic path is only meaningfully tested against
+text output.
 
 ## 9. "No assembly" is not achievable; the honest version is
 

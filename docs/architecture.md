@@ -123,19 +123,44 @@ research/        background material and decisions
   C compiler.
 - `research/decisions.md` records the host language with reasoning — done.
 
-### Phase 2 — Interpreter core (M)
+### Phase 2 — Interpreter core (M) — COMPLETE
 
-Lexer, parser, tree-walking evaluator. Narrow language: integers, `bool`,
-arithmetic, comparison, `if`, `while`, functions, variables.
+Lexer, parser, tree-walking evaluator. Narrow language: integers, `bool`, string
+literals, arithmetic, comparison, `if`/`else`, `while`, functions, `return`, and
+variables (decision 13).
 
 The point is to prove the pipeline end to end on a language small enough that
 no design argument is needed. Resist adding features here.
 
-**Exit criteria**
+**Exit criteria — all verified**
 
-- `siyana run hello.sy` prints output.
-- A failing parse produces a diagnostic with a line and column.
-- A runtime type error produces a diagnostic naming the offending expression.
+- `siyana run hello.sy` prints output — confirmed.
+- A failing parse produces a diagnostic with line and column — confirmed, with
+  the offending line echoed and a caret under the column.
+- A runtime type error names the offending expression — confirmed.
+
+Verified by 51 language tests plus 8 CLI contract tests, run on every build
+under both Clang and GCC with `-Werror`.
+
+**Beyond the criteria.** The stress program at
+`tests/` exercises deep recursion and nested scopes; it was used to catch a
+scope-teardown double-free that the shallow test cases missed.
+
+**Known limits, by design.** The language slice is intentionally narrow and
+does *not* include: return types (`fn f() -> int`), `string` as a declared type,
+string concatenation, or any form of user-defined types. `print` is the only
+builtin. All of these belong to Phase 3.
+
+**Compiler coverage.** `-Werror` is on for every build. GCC caught two defects
+Clang accepted: a misplaced `static` qualifier, and a `snprintf` that could
+truncate. Both are portability bugs that would have surfaced later on other
+toolchains, which is the argument for building with both compilers.
+
+**[Unverified]** Memory leaks. AddressSanitizer is not available in this MinGW
+installation (`libclang_rt.asan` is missing), so the leak check that should
+accompany this phase has not been run. It should be enabled when a toolchain
+with a sanitizer runtime is available, or on a POSIX host where ASan ships with
+the compiler.
 
 ### Phase 3 — Semantic core (L)
 
@@ -327,19 +352,22 @@ Not yet decided, and each blocks a specific phase:
 | Compile-time evaluation design | Phase 3 | Interacts with generics and const sizing; retrofitting is expensive. |
 | Closures vs. first-class function pointers | Phase 3 | Closures are in the deferred list but this decides whether deferral is even possible. |
 | Module system | Phase 4 | Needed before the freestanding split. |
-| Source file extension | Phase 2 | Cosmetic, but cheap to settle now and annoying to change later. |
 
-**[Note]** Phase 1 is unblocked and can proceed immediately. Phase 2 needs only
-a narrow slice of the language — integers, `bool`, arithmetic, comparison,
-`if`, `while`, functions, variables — none of which depends on the open
-questions above.
+**[Settled]** Source file extension (`.sy`), comment syntax, and grammar shape
+were settled before Phase 2 — see decisions 10 to 12.
 
 ## What to do next
 
-Phase 1, then Phase 2. Neither is blocked.
+Phases 1 and 2 are complete. Phase 3 — the semantic core — is next and is
+blocked on the first two rows of the table above.
 
-The recommendation is to settle the allocator and error-handling questions
-*during* Phase 3 rather than in advance of it, by writing the two or three
-prototype programs that would settle them and seeing which design survives
-contact with real code. Those questions are cheap to answer with a prototype
-and expensive to answer in the abstract.
+The recommendation stands: settle the allocator and error-handling questions
+*during* Phase 3 by writing the two or three prototype programs that would
+settle them, and keeping whichever design survives contact with real code. Those
+questions are cheap to answer with a prototype and expensive to answer in the
+abstract.
+
+Also outstanding, and cheap to do while the language is still small: revisit
+decision 12 (braces and semicolons). It was explicitly deferred as a decision
+that should be revisited before Phase 3, because the cost of switching later
+grows with every line of code written.
