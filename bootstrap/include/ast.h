@@ -115,6 +115,11 @@ typedef enum {
      * research/design/allocators.md. */
     TYPE_ALLOCATOR,
 
+    /* `String` -- a byte sequence whose length is a runtime value, not part of
+     * its type. Distinct from `[N]Character`, whose length is fixed by the
+     * declaration. See decision 27. */
+    TYPE_STRING,
+
     /* `[N]T` -- a fixed-size array. Value semantics, like a struct: assigning
      * one copies the elements. The length is fixed at the declaration, which is
      * what makes an array usable as a page table or a register file. */

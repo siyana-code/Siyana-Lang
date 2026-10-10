@@ -103,6 +103,19 @@ typedef struct {
     size_t allocator_count;
     size_t allocator_capacity;
 
+    /* Every String's bytes, for the life of the run.
+     *
+     * A String does not own its characters; it points into here. That is one
+     * rule with no exceptions, where per-value ownership would need a
+     * borrowed-or-owned flag carried on every String and checked at every copy
+     * site -- and a flag checked in the wrong place is a use-after-free.
+     *
+     * It also fixes what ReadLine used to do: a second call invalidated the
+     * first result, which was documented rather than defended against. */
+    char *string_arena;
+    size_t string_arena_length;
+    size_t string_arena_capacity;
+
     bool failed;
     char message[192];
     Position error_position;
@@ -223,6 +236,7 @@ const char *type_kind_name(TypeKind type) {
         case TYPE_CHARACTER: return "Character";
         case TYPE_NAMED:     return "a named type";
         case TYPE_ALLOCATOR:  return "Allocator";
+        case TYPE_STRING:     return "String";
         default:             return "unknown";
     }
     }
@@ -299,6 +313,7 @@ static bool integer_fits(long long value, TypeKind type) {
  * `Variable x: Number32 = "a"` is not. */
 static bool value_matches_type(Value value, TypeKind declared) {
     if (declared == TYPE_ALLOCATOR) return value.type == VALUE_ALLOCATOR;
+    if (declared == TYPE_STRING) return value.type == VALUE_STRING;
     if (value.type != VALUE_INTEGER) return false;
     return value.as.integer.type == declared;
 }
@@ -420,6 +435,13 @@ static bool evaluate_array_method(InterpState *state, const Expr *expression,
 static bool evaluate_array_literal(InterpState *state, const Expr *expression,
                                    Scope *scope, const ArraySpec *spec, Value *out);
 
+/* Defined with the string helpers; both are reached from evaluate_field, which
+ * is earlier in the file. */
+static bool evaluate_string_method(InterpState *state, const Expr *expression,
+                                   const Value *string, Value *out);
+static bool evaluate_array_text(InterpState *state, const Expr *expression,
+                                const Value *array, Value *out);
+
 /* Defined with the allocator helpers; every size and offset in the language is
  * a Word, so the narrowing rule is needed in all three of those functions. */
 static bool require_word(InterpState *state, const char *what, Position position,
@@ -450,6 +472,42 @@ static Value value_character(long long bits) {
     return value_integer(bits, TYPE_CHARACTER);
 }
 
+/* --- The string arena ------------------------------------------------------ */
+
+/* Copies `length` bytes into the run's string arena and returns where they
+ * landed. The returned pointer stays valid for the whole run, which is what
+ * lets a String value be copied by assignment without copying any bytes.
+ *
+ * A String's length is not part of its type, so it cannot be stored inline the
+ * way `[N]Character` can. Every operation that produces a String -- a literal, a
+ * read, a concatenation -- goes through here, and none of them owns the result. */
+static const char *intern(InterpState *state, const char *bytes, size_t length,
+                          Position position) {
+    /* One spare byte so a string can be NUL-terminated without the caller
+     * asking for it. Nothing in the language relies on that; printf-free code
+     * would, and the cost is one byte. */
+    if (state->string_arena_length + length + 1 > state->string_arena_capacity) {
+        size_t wanted = state->string_arena_length + length + 1;
+        size_t capacity = state->string_arena_capacity == 0 ? 1024
+                                                            : state->string_arena_capacity;
+        while (capacity < wanted) capacity *= 2;
+        char *grown = realloc(state->string_arena, capacity);
+        if (grown == NULL) {
+            fail(state, position, "out of memory storing a string of %zu byte(s)",
+                 length);
+            return NULL;
+        }
+        state->string_arena = grown;
+        state->string_arena_capacity = capacity;
+    }
+
+    char *at = state->string_arena + state->string_arena_length;
+    if (length > 0) memcpy(at, bytes, length);
+    at[length] = '\0';
+    state->string_arena_length += length + 1;
+    return at;
+}
+
 static Value value_string(const char *chars, size_t length) {
     Value value = {0};
     value.type = VALUE_STRING;
@@ -458,12 +516,80 @@ static Value value_string(const char *chars, size_t length) {
     return value;
 }
 
+/* A String value whose bytes live in the run's arena. */
+static bool make_string(InterpState *state, const char *bytes, size_t length,
+                        Position position, Value *out) {
+    const char *stored = intern(state, bytes, length, position);
+    if (stored == NULL) return false;
+    *out = value_string(stored, length);
+    return true;
+}
+
 /* String equality compares contents, not pointers. Pointer comparison would
  * make "a" == "a" depend on how the lexer allocated, which is exactly the
  * hidden behaviour the language is meant to avoid. */
 static bool strings_equal(Value a, Value b) {
     if (a.as.string.length != b.as.string.length) return false;
     return memcmp(a.as.string.chars, b.as.string.chars, a.as.string.length) == 0;
+}
+
+/* `a + b` on strings. Two Strings concatenate; a Character on the right
+ * appends one byte, which is how a string gets built a byte at a time when the
+ * length is not known in advance.
+ *
+ * A Character on the *left* is refused. `"x" + c` reads as appending and
+ * `c + "x"` does not, and allowing one without the other is how a program ends
+ * up with a byte at the wrong end of a path. */
+static bool concatenate(InterpState *state, Value left, Value right,
+                        Position position, Value *out) {
+    if (left.type == VALUE_STRING && right.type == VALUE_STRING) {
+        /* The two may not be contiguous in the arena, so the bytes are gathered
+         * into a scratch buffer first. The scratch is bounded by the two
+         * lengths, so the only cost is one allocation per concatenation. */
+        size_t total = left.as.string.length + right.as.string.length;
+        char *joined = malloc(total + 1);
+        if (joined == NULL) {
+            fail(state, position, "out of memory joining two strings");
+            return false;
+        }
+        memcpy(joined, left.as.string.chars, left.as.string.length);
+        memcpy(joined + left.as.string.length, right.as.string.chars,
+               right.as.string.length);
+        bool ok = make_string(state, joined, total, position, out);
+        free(joined);
+        return ok;
+    }
+
+    if (left.type == VALUE_STRING && right.type == VALUE_INTEGER) {
+        /* A Number literal narrows to a Character when it fits, the same rule
+         * an array element and a variable initialiser get. `"A" + 65` is a
+         * thing a programmer means; making them write `Word(65)` for it, or
+         * casting, is how a width gets quietly mixed later. */
+        long long byte = right.as.integer.bits;
+        if (right.as.integer.type == TYPE_NUMBER && integer_fits(byte, TYPE_CHARACTER)) {
+            byte = (unsigned char)byte;
+        } else if (right.as.integer.type != TYPE_CHARACTER) {
+            fail(state, position, "cannot append %s to a String",
+                 type_kind_name(right.as.integer.type));
+            return false;
+        }
+
+        size_t total = left.as.string.length + 1;
+        char *joined = malloc(total + 1);
+        if (joined == NULL) {
+            fail(state, position, "out of memory appending to a string");
+            return false;
+        }
+        memcpy(joined, left.as.string.chars, left.as.string.length);
+        joined[left.as.string.length] = (char)(unsigned char)byte;
+        bool ok = make_string(state, joined, total, position, out);
+        free(joined);
+        return ok;
+    }
+
+    fail(state, position, "cannot apply '+' to %s and %s",
+         type_name_of(left), type_name_of(right));
+    return false;
 }
 
 /* --- Binary operators ------------------------------------------------------ */
@@ -988,6 +1114,14 @@ static bool evaluate_binary(InterpState *state, const Expr *expression,
         return true;
     }
 
+    /* Concatenation is the one arithmetic that is not arithmetic, so it is
+     * answered before the type check rather than through it. */
+    if (expression->op == OP_ADD &&
+        (left.type == VALUE_STRING ||
+         (right.type == VALUE_STRING && right.type != VALUE_INTEGER))) {
+        return concatenate(state, left, right, expression->position, out);
+    }
+
     /* Every other operator needs two integers of the same type. */
     if (left.type != VALUE_INTEGER || right.type != VALUE_INTEGER) {
         fail(state, expression->position,
@@ -1447,11 +1581,11 @@ static bool evaluate_builtin(InterpState *state, const Expr *expression,
             return true;
         }
 
-        /* Ownership passes to the returned value. A subsequent ReadLine
-         * invalidates it, which is documented rather than defended against:
-         * proper ownership needs the allocator model from decision 14. */
-        *out = value_string(buffer, length);
-        return true;
+        /* Into the run's arena, like every other String. Previously this
+         * handed back an owned buffer and a second ReadLine invalidated the
+         * first result -- documented rather than defended against, because
+         * nothing else could be done without an arena to put them in. */
+        return make_string(state, buffer, length, expression->position, out);
     }
 
     fail(state, expression->position, "unknown builtin");
@@ -2100,6 +2234,9 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
     }
 
     if (base.type != VALUE_STRUCT) {
+        if (base.type == VALUE_STRING) {
+            return evaluate_string_method(state, expression, &base, out);
+        }
         if (base.type == VALUE_ALLOCATOR) {
             /* A method call, dispatched by the receiver's type. `a.Allocate` and
              * `Value.Number` are the same three tokens; only the receiver
@@ -2108,6 +2245,12 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
                                             base.as.allocator, out);
         }
         if (base.type == VALUE_ARRAY) {
+            /* `Text` is dispatched here for every array, not just a Character
+             * one, so that calling it on the wrong element type says what the
+             * element type is rather than that no such method exists. */
+            if (strcmp(expression->name, "Text") == 0) {
+                return evaluate_array_text(state, expression, &base, out);
+            }
             return evaluate_array_method(state, expression, scope, &base, out);
         }
         fail(state, expression->position,
@@ -2345,11 +2488,117 @@ static bool evaluate_array_method(InterpState *state, const Expr *expression,
     return true;
 }
 
+/* --- Strings ---------------------------------------------------------------- */
+
+/* `s.Length()` and `s[from..to]` on a String.
+ *
+ * The range form is here and not on arrays for a reason worth stating: an
+ * array's length is part of its type, so a sub-range's length would be a
+ * runtime value and could not be an array. A String's length is already a
+ * runtime value, so a sub-range is just a shorter view of the same bytes --
+ * no reference needed, and nothing that can dangle.
+ *
+ * Returned as a String rather than as a view, because that is all this language
+ * can currently say. It copies nothing: the bytes are already in the arena. */
+static bool evaluate_string_method(InterpState *state, const Expr *expression,
+                                   const Value *string, Value *out) {
+    if (strcmp(expression->name, "Length") == 0) {
+        if (expression->argument_count != 0) {
+            fail(state, expression->position, "Length expects 0 arguments, got %zu",
+                 expression->argument_count);
+            return false;
+        }
+        *out = value_word((long long)string->as.string.length);
+        return true;
+    }
+
+    fail(state, expression->position, "a String has no method '%s'",
+         expression->name);
+    return false;
+}
+
+/* `s[i]` -- one byte, as a Character. Bounds are checked with the same rule as
+ * an array's, because it is the same mistake: an index that runs off the end. */
+static bool evaluate_string_index(InterpState *state, const Expr *expression,
+                                  Scope *scope, const Value *string, Value *out) {
+    Value index;
+    if (!evaluate(state, expression->right, scope, &index)) return false;
+    if (index.type != VALUE_INTEGER) {
+        fail(state, expression->position, "a String index must be an integer, got %s",
+             type_name_of(index));
+        return false;
+    }
+
+    long long at = index.as.integer.bits;
+    if (index.as.integer.type != TYPE_WORD) {
+        if (index.as.integer.type != TYPE_NUMBER || at < 0) {
+            fail(state, expression->position, "a String index must not be negative");
+            return false;
+        }
+    }
+    if ((unsigned long long)at >= (unsigned long long)string->as.string.length) {
+        fail(state, expression->position,
+             "index %lld is outside this String of %zu byte(s)",
+             at, string->as.string.length);
+        return false;
+    }
+
+    *out = value_integer((unsigned char)string->as.string.chars[at], TYPE_CHARACTER);
+    return true;
+}
+
+/* `array.Text()` -- the bytes of a Character array as a String.
+ *
+ * The bridge an OS needs: a file arrives as bytes, and a file path is a
+ * String. Going the other way is not offered, because an array's length is
+ * fixed by its declaration and a String's is not -- there is no `[s.Length()]`
+ * to write. Bytes out of a String are `s[i]`, one at a time. */
+static bool evaluate_array_text(InterpState *state, const Expr *expression,
+                                const Value *array, Value *out) {
+    if (strcmp(expression->name, "Text") != 0) {
+        fail(state, expression->position, "an array has no method '%s'",
+             expression->name);
+        return false;
+    }
+    if (expression->argument_count != 0) {
+        fail(state, expression->position, "Text expects 0 arguments, got %zu",
+             expression->argument_count);
+        return false;
+    }
+    if (array->as.array.element_type != TYPE_CHARACTER) {
+        fail(state, expression->position,
+             "Text needs an array of Character, got an array of %s",
+             array->as.array.element_type == TYPE_NAMED
+                 ? array->as.array.element_type_name
+                 : type_kind_name(array->as.array.element_type));
+        return false;
+    }
+
+    char *joined = malloc(array->as.array.count + 1);
+    if (joined == NULL) {
+        fail(state, expression->position, "out of memory reading an array as text");
+        return false;
+    }
+    for (size_t i = 0; i < array->as.array.count; i++) {
+        joined[i] = (char)(array->as.array.elements[i].as.integer.bits & 0xFF);
+    }
+    bool ok = make_string(state, joined, array->as.array.count,
+                          expression->position, out);
+    free(joined);
+    return ok;
+}
+
 /* `expr[index]` -- an element read. */
 static bool evaluate_index(InterpState *state, const Expr *expression, Scope *scope,
                            Value *out) {
     Value target;
     if (!evaluate(state, expression->left, scope, &target)) return false;
+    if (target.type == VALUE_STRING) {
+        /* A String indexes to a Character rather than to a String of length 1.
+         * The byte is the useful thing -- it is what a byte buffer is made of,
+         * and what `name[i] == '/'` tests a path with. */
+        return evaluate_string_index(state, expression, scope, &target, out);
+    }
     if (target.type != VALUE_ARRAY) {
         fail(state, expression->position,
              "cannot index %s", type_name_of(target));
@@ -2814,8 +3063,13 @@ static bool evaluate(InterpState *state, const Expr *expression,
         }
 
         case EXPR_STRING:
-            *out = value_string(expression->text, expression->text_length);
-            return true;
+            /* Interned, not borrowed from the AST. The literal's bytes could
+             * be taken directly from the token, but a String has to be
+             * indistinguishable from one built by `+`, and one of those
+             * cannot point into the source. Two kinds of String with two
+             * lifetimes is a rule nobody holds in their head. */
+            return make_string(state, expression->text, expression->text_length,
+                               expression->position, out);
 
         case EXPR_IDENT: {
             Value found;
@@ -3377,6 +3631,10 @@ int interp_run(const Program *program, Interp *interp) {
 
     for (size_t i = 0; i < state.allocator_count; i++) allocator_destroy(state.allocators[i]);
     free(state.allocators);
+
+    /* The string arena is the one piece of value storage that has a known,
+     * single owner, so it is freed rather than recorded as a leak. */
+    free(state.string_arena);
 
     free(state.functions);
     scope_destroy_chain(state.global_scope);

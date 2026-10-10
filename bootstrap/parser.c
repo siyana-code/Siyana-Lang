@@ -317,6 +317,10 @@ static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named,
         *out_type = TYPE_CHARACTER;
         return true;
     }
+    if (match(parser, TOKEN_STRING_TYPE)) {
+        *out_type = TYPE_STRING;
+        return true;
+    }
 
     /* A named type: `Variable p: Point`. Recorded as TYPE_NAMED, with the name
      * in `out_named`; `out_type` is set to TYPE_NAMED so the caller knows to
