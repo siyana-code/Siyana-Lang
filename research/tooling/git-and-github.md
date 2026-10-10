@@ -188,24 +188,35 @@ Notes from the documentation that affect real decisions:
 selection that have run on the protected branch within the last seven days, so
 required checks cannot be configured until CI has run on `main` at least once.
 
-### Recommendation for this repository
+### Applied to this repository
 
-**[Synthesis]** Enable now:
+**[Synthesis]** A ruleset named `protect-main` is active on the default branch,
+containing:
 
-- `Require a pull request before merging` — 1 approval. Once there is more than
-  one maintainer, move to 2. Note the ruleset's Copilot caveat: when Copilot
-  opens an unattributed PR, the ruleset requires one extra approval by default,
-  because the usual assumption (author and approver are two different people)
-  no longer holds.
-- `Block force pushes` and `Restrict deletions` — already on by default.
-- `Require linear history` — with squash merges, keeps `git log` readable.
-- `Require signed commits` — worth enabling once other contributors exist.
+| Rule | Setting |
+| --- | --- |
+| `deletion` | Restrict deletions |
+| `non_fast_forward` | Block force pushes |
+| `required_linear_history` | Linear history, squash merge only |
+| `pull_request` | 1 approval, dismiss stale reviews, require approval of last push, require conversation resolution |
 
-Defer until CI exists:
+**[Synthesis]** Not yet enabled, and why:
 
-- `Require status checks to pass` (Strict) — nothing to require yet.
-- `Require a merge queue` — a single-author repository gains nothing from it,
-  and it adds queue latency.
+- `required_status_checks` — nothing to require until CI exists on `main`.
+  Per GitHub's documentation and community reports, checks must have run on the
+  protected branch within the last seven days before they can be selected, so
+  this cannot be configured until the workflow exists.
+- `merge_queue` — a single-author repository gains nothing and it adds latency.
+- `required_signatures` — enable once there are outside contributors.
+
+**[Synthesis]** On the Copilot caveat: when Copilot opens an unattributed pull
+request, GitHub requires one extra approval by default, because the usual
+assumption (the author and the approver are two different people) no longer
+holds. Worth revisiting when automation is introduced.
+
+**[Primary]** The ruleset is managed through the REST API. Note that the
+`pull_request` rule requires `require_code_owner_review` to be present
+explicitly — omitting it returns a 422 validation error rather than a default.
 
 ## Versioning: SemVer 2.0.0
 
