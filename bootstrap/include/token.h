@@ -99,7 +99,11 @@ typedef enum {
     TOKEN_CARET,
     TOKEN_TILDE,
     TOKEN_SHIFT_LEFT,
-    TOKEN_SHIFT_RIGHT
+    TOKEN_SHIFT_RIGHT,
+
+    /* Indexing and array types. */
+    TOKEN_LBRACKET,
+    TOKEN_RBRACKET
 } TokenType;
 
 /* A source position. Both are 1-based so diagnostics can be printed directly

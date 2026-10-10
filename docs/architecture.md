@@ -214,31 +214,35 @@ decisions are made, which is the state Phase 3 was supposed to reach.
 
 **Remaining**
 
-1. Arrays and a `String` type — the two that block writing anything substantial.
-2. Named constants.
+1. A `String` type — the last thing blocking writing anything substantial.
+   Arrays landed in decision 26; a string is the other half.
+2. Named constants, which is also the concrete need the deferred
+   compile-time-evaluation question keeps turning up.
 3. Buffers and borrows, which unblock the ergonomics the allocator model was
    chosen for. Allocators currently hand out offsets because nothing yet means
-   "a reference to a struct" (decision 24).
+   "a reference to a struct" (decision 24). Slices are blocked on the same
+   question: a sub-range of an array has no way to be named.
+4. `enum`, `SizeOf`, `For`, compound assignment — convenience, not blocking.
 
-**[Known defect]** Every struct and union value leaks its `fields` array.
-`free_aggregate_fields` is reached only from the error paths inside
-`evaluate_struct_init` and `evaluate_union_init`; nothing on the success path
-frees, and `scope_destroy` releases the name but not the value. A program that
-builds a struct in a loop grows memory without bound.
+**[Known defect]** Every struct and union value leaks its `fields` array, and
+every array value now leaks its `elements`. `free_aggregate_fields` is reached
+only from the error paths inside `evaluate_struct_init` and `evaluate_union_init`;
+nothing on the success path frees, and `scope_destroy` releases the name but not
+the value. A program that builds a struct in a loop grows memory without bound.
 
 Recorded rather than fixed because the fix needs a decision, not a patch: a
-`Value` holding a struct must be deep-copied when copied (decision 21) *and*
-deep-freed when dropped, which puts that responsibility at every `Value` copy
-site. Half of it — the copy half — is already done via `value_copy`. The free
-half is not.
+`Value` holding a struct or an array must be deep-copied when copied (decisions
+21 and 26) *and* deep-freed when dropped, which puts that responsibility at
+every `Value` copy site. Half of it — the copy half — is already done via
+`value_copy`. The free half is not.
 
 Survivable while the interpreter is a bootstrap tool that will itself be
 replaced; not survivable in the language. Compounding it, the Phase 2 note
 above still stands: no sanitizer runtime is available on this toolchain, so
 this is reasoned from reading the code rather than measured. It should be fixed
-before the allocator model lands, because that is when leak *detection* becomes
-the programmer's job and they will need to trust the interpreter's own
-diagnostics.
+before buffers or pointers land, because that is the point at which ownership
+stops being an implementation detail and becomes something the language
+promises.
 
 ### Phase 4 — Freestanding subset (M)
 

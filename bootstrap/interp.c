@@ -311,6 +311,7 @@ static const char *type_name_of(Value value) {
         case VALUE_STRUCT: return "a struct";
         case VALUE_UNION:  return "a union";
         case VALUE_ALLOCATOR: return "Allocator";
+        case VALUE_ARRAY:    return "an array";
         case VALUE_RESULT: return "a Result";
         default:           return "unknown";
     }
@@ -364,9 +365,20 @@ static Value copy_aggregate(Value value) {
     return copy;
 }
 
-/* Structs and unions are value types: reading one out of a variable or
+/* Structs, unions, and arrays are value types: reading one out of a variable or
  * passing one to a function copies it. */
 static Value value_copy(Value value) {
+    if (value.type == VALUE_ARRAY) {
+        Value copy = value;
+        size_t count = value.as.array.count;
+        copy.as.array.elements = malloc(count * sizeof(Value));
+        if (copy.as.array.elements != NULL) {
+            for (size_t i = 0; i < count; i++) {
+                copy.as.array.elements[i] = value_copy(value.as.array.elements[i]);
+            }
+        }
+        return copy;
+    }
     if (value.type == VALUE_STRUCT || value.type == VALUE_UNION) {
         return copy_aggregate(value);
     }
@@ -397,6 +409,16 @@ static bool make_result_error(const Decl *decl, size_t variant, Value *out);
  * other, so rule 1 has to reach it. */
 static bool evaluate_ambient_allocate(InterpState *state, const Expr *expression,
                                       Scope *scope, Value *out);
+
+/* Defined with the array helpers; a method call on an array reaches it from
+ * evaluate_field, which is earlier. */
+static bool evaluate_array_method(InterpState *state, const Expr *expression,
+                                  Scope *scope, const Value *array, Value *out);
+
+/* A call argument may be an array literal, whose shape comes from the parameter
+ * rather than from anywhere near the literal. */
+static bool evaluate_array_literal(InterpState *state, const Expr *expression,
+                                   Scope *scope, const ArraySpec *spec, Value *out);
 
 /* Defined with the allocator helpers; every size and offset in the language is
  * a Word, so the narrowing rule is needed in all three of those functions. */
@@ -1126,7 +1148,25 @@ static bool call_function(InterpState *state, const Function *function,
          * boundary. */
         Value argument = value_as_plain(arguments[i]);
         TypeKind expected = parameter->type;
-        if (expected == TYPE_NAMED) {
+        if (expected == TYPE_ARRAY) {
+            /* The element type was checked where the array was built; here only
+             * the shape is, since an array passed in carries its own length. */
+            if (argument.type != VALUE_ARRAY) {
+                fail(state, parameter->position,
+                     "parameter '%s' of '%s' expects an array, got %s",
+                     parameter->name, declaration->name, type_name_of(argument));
+                scope_destroy(call_scope);
+                return false;
+            }
+            if (argument.as.array.count != parameter->array.length) {
+                fail(state, parameter->position,
+                     "parameter '%s' of '%s' expects an array of %zu, got %zu",
+                     parameter->name, declaration->name,
+                     parameter->array.length, argument.as.array.count);
+                scope_destroy(call_scope);
+                return false;
+            }
+        } else if (expected == TYPE_NAMED) {
             /* Same identity check as a variable initialiser: a value of a
              * different struct type is rejected even if its fields match. */
             const Decl *decl = resolve_named(state, parameter->type_name);
@@ -1280,6 +1320,18 @@ static void write_value(Value value) {
         default:
             printf("nothing");
             break;
+        case VALUE_ARRAY: {
+            /* Printed as `[a, b, c]` so the contents are visible. An unset
+             * element shows as `nothing`, which is honest: an array declared
+             * without a literal starts with every element unchosen. */
+            printf("[");
+            for (size_t i = 0; i < value.as.array.count; i++) {
+                if (i > 0) printf(", ");
+                write_value(value.as.array.elements[i]);
+            }
+            printf("]");
+            break;
+        }
         case VALUE_RESULT:
             /* Only reachable if a Result is printed directly, which rule 1 is
              * meant to prevent. Shown rather than hidden so that if the rule is
@@ -1417,10 +1469,23 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
 
     bool ok = true;
     for (size_t i = 0; i < expression->argument_count; i++) {
-        if (!evaluate(state, expression->arguments[i], scope, &arguments[i])) {
-            ok = false;
-            break;
+        /* An array literal has no type of its own -- its length and element type
+         * come from where it is going. A variable initialiser has that to hand,
+         * so it handles its own literal; a call argument does not, and the
+         * parameter is the only place the shape is written down.
+         *
+         * `function` is NULL for the ambient `Allocate`, which has no
+         * parameters and therefore no shape to take. */
+        if (function != NULL && i < function->declaration->parameter_count &&
+            function->declaration->parameters[i].type == TYPE_ARRAY &&
+            expression->arguments[i]->type == EXPR_ARRAY_LITERAL) {
+            ok = evaluate_array_literal(state, expression->arguments[i], scope,
+                                        &function->declaration->parameters[i].array,
+                                        &arguments[i]);
+        } else {
+            ok = evaluate(state, expression->arguments[i], scope, &arguments[i]);
         }
+        if (!ok) break;
     }
 
     if (ok) {
@@ -2016,6 +2081,9 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
             return evaluate_allocator_method(state, expression, scope,
                                             base.as.allocator, out);
         }
+        if (base.type == VALUE_ARRAY) {
+            return evaluate_array_method(state, expression, scope, &base, out);
+        }
         fail(state, expression->position,
              "cannot read field '%s' from %s", expression->name, type_name_of(base));
         return false;
@@ -2047,6 +2115,264 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
  *
  * Copying on read is still correct for everything that only reads a struct.
  */
+/* --- Arrays ---------------------------------------------------------------- */
+
+/* A fresh array of `count` elements, every one Nothing.
+ *
+ * Nothing rather than a zero of the element type: an array of structs with
+ * every field unset is a real state, and initialising it to zeroed fields would
+ * be a lie about which fields the programmer has chosen. Elements are filled in
+ * by the literal or left for assignment. */
+static bool make_array(InterpState *state, size_t count, TypeKind element_type,
+                       const char *element_name, Position position, Value *out) {
+    memset(out, 0, sizeof(*out));
+    out->type = VALUE_ARRAY;
+    out->as.array.count = count;
+    out->as.array.element_type = element_type;
+    out->as.array.element_type_name = (char *)element_name;
+    out->as.array.elements = calloc(count, sizeof(Value));
+    if (out->as.array.elements == NULL) {
+        fail(state, position, "out of memory creating an array of %zu", count);
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        out->as.array.elements[i] = value_nil();
+    }
+    return true;
+}
+
+/* Checks one value against an array's element type, applying the same literal
+ * narrowing a variable initialiser gets. Returns false with a diagnostic.
+ *
+ * A struct or union element is compared by identity against its declaration
+ * rather than by type name, for the same reason a variable initialiser does it
+ * that way: two aggregates with the same field names are still distinct. */
+static bool array_element_fits(InterpState *state, Value value, TypeKind element,
+                               const char *element_name, Position position,
+                               const char *where, Value *out) {
+    if (element == TYPE_NAMED) {
+        const Decl *decl = resolve_named(state, element_name);
+        if (decl == NULL) {
+            fail(state, position, "undefined type '%s'", element_name);
+            return false;
+        }
+        if (value.type != (decl->is_union ? VALUE_UNION : VALUE_STRUCT) ||
+            value.as.aggregate.decl != decl) {
+            fail(state, position, "%s expects %s, got %s", where, element_name,
+                 type_name_of(value));
+            return false;
+        }
+        *out = value;
+        return true;
+    }
+    if (value_matches_type(value, element)) {
+        *out = value;
+        return true;
+    }
+    if (value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER &&
+        integer_fits(value.as.integer.bits, element)) {
+        *out = value_integer(value.as.integer.bits, element);
+        return true;
+    }
+    fail(state, position, "%s expects %s, got %s", where,
+         type_kind_name(element), type_name_of(value));
+    return false;
+}
+
+/* `Type [a, b, c]` -- an array literal, checked against the declared type. */
+static bool evaluate_array_literal(InterpState *state, const Expr *expression,
+                                   Scope *scope, const ArraySpec *spec, Value *out) {
+    if (expression->argument_count != spec->length) {
+        fail(state, expression->position,
+             "this array has %zu element(s) but %zu were given",
+             spec->length, expression->argument_count);
+        return false;
+    }
+
+    Value result;
+    if (!make_array(state, spec->length, spec->element, spec->element_name,
+                    expression->position, &result)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < spec->length; i++) {
+        Value element;
+        if (!evaluate(state, expression->arguments[i], scope, &element)) {
+            return false;
+        }
+        if (!array_element_fits(state, element, spec->element, spec->element_name,
+                                expression->arguments[i]->position, "an array element",
+                                &result.as.array.elements[i])) {
+            return false;
+        }
+    }
+
+    *out = result;
+    return true;
+}
+
+/* Declared type of a variable being initialised as an array. */
+static bool evaluate_array_declaration(InterpState *state, const Expr *initializer,
+                                      Scope *scope, const Stmt *declaration, Value *out) {
+    if (initializer == NULL) {
+        return make_array(state, declaration->array.length, declaration->array.element,
+                          declaration->array.element_name, declaration->position, out);
+    }
+
+    if (initializer->type == EXPR_ARRAY_LITERAL) {
+        return evaluate_array_literal(state, initializer, scope, &declaration->array, out);
+    }
+
+    /* Copying an existing array. The length must match exactly: a shorter one
+     * would leave elements the programmer believes were set, and a longer one
+     * would silently drop values. The element type must match too, or the copy
+     * would quietly re-type every element it holds. */
+    Value source;
+    if (!evaluate(state, initializer, scope, &source)) return false;
+    if (source.type != VALUE_ARRAY) {
+        fail(state, initializer->position, "cannot initialise an array with %s",
+             type_name_of(source));
+        return false;
+    }
+    if (source.as.array.count != declaration->array.length) {
+        fail(state, initializer->position,
+             "this array holds %zu element(s) but %zu were given",
+             declaration->array.length, source.as.array.count);
+        return false;
+    }
+    if (source.as.array.element_type != declaration->array.element ||
+        (declaration->array.element == TYPE_NAMED &&
+         strcmp(source.as.array.element_type_name == NULL ? "" :
+                source.as.array.element_type_name,
+                declaration->array.element_name == NULL ? "" :
+                declaration->array.element_name) != 0)) {
+        fail(state, initializer->position,
+             "this array holds %s but %zu %s were given",
+             source.as.array.element_type == TYPE_NAMED
+                 ? source.as.array.element_type_name
+                 : type_kind_name(source.as.array.element_type),
+             declaration->array.length,
+             declaration->array.element == TYPE_NAMED
+                 ? declaration->array.element_name
+                 : type_kind_name(declaration->array.element));
+        return false;
+    }
+    *out = value_copy(source);
+    return true;
+}
+
+/* Resolves an index expression to a Word and range-checks it.
+ *
+ * Bounds are checked here rather than trusted. An array index that runs off the
+ * end is a memory-safety bug, and this language has no pointer arithmetic for a
+ * programmer to have got wrong -- so if the check is missing, it is a bug in
+ * this function, not in the caller. */
+static bool array_index_of(InterpState *state, const Expr *expression, Scope *scope,
+                           const Value *array, size_t *out) {
+    Value index;
+    if (!evaluate(state, expression->right, scope, &index)) return false;
+
+    if (index.type != VALUE_INTEGER) {
+        fail(state, expression->position, "an array index must be an integer, got %s",
+             type_name_of(index));
+        return false;
+    }
+
+    long long position = index.as.integer.bits;
+    if (index.as.integer.type != TYPE_WORD) {
+        if (index.as.integer.type == TYPE_NUMBER && position >= 0) {
+            /* A Number literal index is fine; it is a count, not data. */
+        } else {
+            fail(state, expression->position, "an array index must not be negative");
+            return false;
+        }
+    }
+
+    if ((unsigned long long)position >= (unsigned long long)array->as.array.count) {
+        fail(state, expression->position,
+             "index %lld is outside this array of %zu element(s)",
+             position, array->as.array.count);
+        return false;
+    }
+
+    *out = (size_t)position;
+    return true;
+}
+
+/* `Length()` on an array. Kept separate from the Allocator methods because the
+ * two have nothing in common beyond being methods, and merging them would mean
+ * a dispatch on type before the receiver's own methods are even reached. */
+static bool evaluate_array_method(InterpState *state, const Expr *expression,
+                                  Scope *scope, const Value *array, Value *out) {
+    (void)scope;   /* Length takes no arguments, so nothing is evaluated. */
+
+    if (strcmp(expression->name, "Length") != 0) {
+        fail(state, expression->position, "an array has no method '%s'", expression->name);
+        return false;
+    }
+    if (expression->argument_count != 0) {
+        fail(state, expression->position, "Length expects 0 arguments, got %zu",
+             expression->argument_count);
+        return false;
+    }
+    *out = value_word((long long)array->as.array.count);
+    return true;
+}
+
+/* `expr[index]` -- an element read. */
+static bool evaluate_index(InterpState *state, const Expr *expression, Scope *scope,
+                           Value *out) {
+    Value target;
+    if (!evaluate(state, expression->left, scope, &target)) return false;
+    if (target.type != VALUE_ARRAY) {
+        fail(state, expression->position,
+             "cannot index %s", type_name_of(target));
+        return false;
+    }
+
+    size_t position = 0;
+    if (!array_index_of(state, expression, scope, &target, &position)) return false;
+    *out = value_copy(target.as.array.elements[position]);
+    return true;
+}
+
+/* `array[index] = value` -- an element assignment.
+ *
+ * Reached through the variable's storage rather than a copy, for the same
+ * reason field assignment does: writing into a copy would discard the write,
+ * and copying on read would make the write visible through both names. */
+static bool assign_index(InterpState *state, const Expr *expression, Scope *scope,
+                         Value value) {
+    const Expr *index = expression->left;
+    if (index == NULL || index->left == NULL || index->left->type != EXPR_IDENT) {
+        fail(state, expression->position, "cannot assign to a nested index");
+        return false;
+    }
+
+    Value *stored = scope_find(scope, index->left->name);
+    if (stored == NULL) {
+        fail(state, expression->position, "undefined variable '%s'",
+             index->left->name);
+        return false;
+    }
+    if (stored->type != VALUE_ARRAY) {
+        fail(state, expression->position, "cannot index %s", type_name_of(*stored));
+        return false;
+    }
+
+    size_t position = 0;
+    if (!array_index_of(state, index, scope, stored, &position)) return false;
+
+    const ArrayValue *array = &stored->as.array;
+    if (!array_element_fits(state, value, array->element_type,
+                            array->element_type_name, expression->position,
+                            "an array element", &value)) {
+        return false;
+    }
+    array->elements[position] = value;
+    return true;
+}
+
 static bool assign_field(InterpState *state, const Expr *expression,
                          Scope *scope, Value value) {
     const Expr *field = expression->left;
@@ -2486,8 +2812,14 @@ static bool evaluate(InterpState *state, const Expr *expression,
             if (!evaluate(state, expression->right, scope, &value)) return false;
 
             if (expression->left != NULL) {
-                /* A field assignment; an OS does this constantly. */
-                if (!assign_field(state, expression, scope, value)) return false;
+                /* A field or element assignment; an OS does both constantly. */
+                bool assigned;
+                if (expression->left->type == EXPR_INDEX) {
+                    assigned = assign_index(state, expression, scope, value);
+                } else {
+                    assigned = assign_field(state, expression, scope, value);
+                }
+                if (!assigned) return false;
                 *out = value;
                 return true;
             }
@@ -2525,6 +2857,16 @@ static bool evaluate(InterpState *state, const Expr *expression,
 
         case EXPR_ALLOCATOR_NEW:
             return evaluate_allocator_new(state, expression, scope, out);
+
+        case EXPR_ARRAY_LITERAL:
+            /* Only reachable from a declaration, which is the one place a
+             * literal's length can be checked against a type. */
+            fail(state, expression->position,
+                 "an array literal needs a declared type");
+            return false;
+
+        case EXPR_INDEX:
+            return evaluate_index(state, expression, scope, out);
 
         case EXPR_CALL:
             return evaluate_call(state, expression, scope, out);
@@ -2566,7 +2908,19 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
 
         case STMT_VARIABLE: {
             Value initial = value_nil();
-            if (statement->initializer != NULL) {
+
+            /* An array is built here rather than by evaluating the initialiser
+             * and type-checking the result: its length comes from the declared
+             * type, and a literal's elements have to be checked against the
+             * element type as each is evaluated. There is no array value to
+             * check afterwards. */
+            if (statement->declared_type == TYPE_ARRAY) {
+                if (!evaluate_array_declaration(state, statement->initializer, scope,
+                                                 statement, &initial)) {
+                    return false;
+                }
+                if (state->propagation.propagating) return true;
+            } else if (statement->initializer != NULL) {
                 /* Push the declared type down so a constant expression in the
                  * initialiser is evaluated in it. `Variable w: Word = 1 << 63`
                  * overflows as a Number and does not as a Word. */

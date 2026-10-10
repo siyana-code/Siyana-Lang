@@ -33,7 +33,8 @@ static const char *const kTypeNames[] = {
     "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
     "'<'", "'<='", "'>'", "'>='",
-    "'&'", "'|'", "'^'", "'~'", "'<<'", "'>>'"
+    "'&'", "'|'", "'^'", "'~'", "'<<'", "'>>'",
+    "'['", "']'"
 };
 
 const char *token_type_name(TokenType type) {
@@ -452,6 +453,8 @@ static void scan_token(Lexer *lexer, TokenList *list) {
             case '|': type = TOKEN_PIPE; break;
             case '^': type = TOKEN_CARET; break;
             case '~': type = TOKEN_TILDE; break;
+            case '[': type = TOKEN_LBRACKET; break;
+            case ']': type = TOKEN_RBRACKET; break;
             case '<':
                 if (match(lexer, '<')) type = TOKEN_SHIFT_LEFT;
                 else type = match(lexer, '=') ? TOKEN_LT_EQ : TOKEN_LT;

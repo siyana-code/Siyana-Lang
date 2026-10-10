@@ -28,8 +28,28 @@ typedef enum {
     VALUE_STRUCT,
     VALUE_UNION,
     VALUE_RESULT,
-    VALUE_ALLOCATOR
+    VALUE_ALLOCATOR,
+    VALUE_ARRAY
 } ValueType;
+
+/* A fixed-size array. Value semantics, like a struct: assigning one copies the
+ * elements, so two names never share storage.
+ *
+ * The element type is carried on the value rather than looked up from the
+ * declaration, because an array is copied and a copy must be able to check its
+ * own elements' types without the declaration still being reachable.
+ *
+ * Declared here, before the forward declaration of Value below, because
+ * ArrayValue is the one aggregate that holds elements by value rather than
+ * through a pointer. */
+typedef struct Value Value;
+
+typedef struct {
+    Value *elements;      /* owned */
+    size_t count;
+    TypeKind element_type;
+    char *element_type_name;  /* borrowed, NULL unless TYPE_NAMED */
+} ArrayValue;
 
 /* A struct or union value.
  *
@@ -77,6 +97,7 @@ struct Value {
          * memory: two copies handing out the same region would hand out the
          * same bytes twice. */
         struct Allocator *allocator;
+        ArrayValue array;
     } as;
     /* Set when the value came from the True or False literal, so output can
      * show the source form. Presentation only -- truthiness follows the

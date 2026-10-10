@@ -254,7 +254,42 @@ void program_free(Program *program) {
  * passes an `out_result`; every other caller rejects it, so a variable of that
  * type cannot be written. That restriction is the point -- see
  * research/design/error-syntax.md. */
-static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named) {
+static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named,
+                       ArraySpec *out_array) {
+    /* `[N]T` -- a fixed-size array. */
+    if (match(parser, TOKEN_LBRACKET)) {
+        if (!check(parser, TOKEN_NUMBER)) {
+            fail(parser, current(parser)->start,
+                 "an array length must be a number, found %s",
+                 token_type_description(current(parser)->type));
+            return false;
+        }
+        const Token *length = advance_token(parser);
+        long long parsed = strtoll(length->text, NULL, 10);
+        if (parsed <= 0) {
+            fail(parser, length->start, "an array length must be greater than zero");
+            return false;
+        }
+        if (!consume(parser, TOKEN_RBRACKET, "']' after an array length")) return false;
+
+        /* The element type is parsed before the outer type is reported, so a
+         * bad element type names the element rather than the array. */
+        TypeKind element = TYPE_NUMBER;
+        if (!parse_type(parser, &element,
+                        out_array != NULL ? &out_array->element_name : NULL, NULL)) {
+            return false;
+        }
+        if (out_array == NULL) {
+            fail(parser, length->start,
+                 "an array type may only be used for a variable or a parameter");
+            return false;
+        }
+        out_array->length = (size_t)parsed;
+        out_array->element = element;
+        *out_type = TYPE_ARRAY;
+        return true;
+    }
+
     if (match(parser, TOKEN_RESULT)) {
         fail(parser, current(parser)->start,
              "'Result{T, E}' may only be a function return type");
@@ -314,7 +349,7 @@ static bool parse_result_type(Parser *parser, Stmt *stmt) {
     if (!consume(parser, TOKEN_LBRACE, "'{' after 'Result'")) return false;
 
     stmt->declared_type = TYPE_RESULT;
-    if (!parse_type(parser, &stmt->result_ok_type, &stmt->result_ok_name)) return false;
+    if (!parse_type(parser, &stmt->result_ok_type, &stmt->result_ok_name, NULL)) return false;
 
     if (!consume(parser, TOKEN_COMMA, "',' between the success type and the error set")) {
         return false;
@@ -341,8 +376,76 @@ static bool parse_result_type(Parser *parser, Stmt *stmt) {
 
 /* --- Primary expressions -------------------------------------------------- */
 
+/* `[1, 2, 3]` -- an array literal.
+ *
+ * Distinct from an array *type* by context rather than by shape: `[4]Word`
+ * has a type after the bracket, `[1, 2]` has a comma or a closing bracket. A
+ * type is only ever parsed where a type belongs -- after `:` in a declaration or
+ * in a parameter list -- so the two never compete for the same `[`.
+ */
+static Expr *parse_array_literal(Parser *parser) {
+    Position start = current(parser)->start;
+    advance_token(parser); /* '[' */
+
+    Expr *literal = expr_new(parser, EXPR_ARRAY_LITERAL, start);
+    if (literal == NULL) return NULL;
+
+    size_t capacity = 4;
+    literal->arguments = malloc(capacity * sizeof(Expr *));
+    if (literal->arguments == NULL) {
+        fail(parser, start, "out of memory");
+        expr_free(literal);
+        return NULL;
+    }
+
+    if (!check(parser, TOKEN_RBRACKET)) {
+        do {
+            if (literal->argument_count + 1 > capacity) {
+                capacity *= 2;
+                Expr **grown = realloc(literal->arguments,
+                                       capacity * sizeof(Expr *));
+                if (grown == NULL) {
+                    fail(parser, start, "out of memory");
+                    expr_free(literal);
+                    return NULL;
+                }
+                literal->arguments = grown;
+            }
+
+            Expr *element = parse_expression(parser);
+            if (parser->failed) {
+                expr_free(literal);
+                return NULL;
+            }
+            element = parse_postfix(parser, element);
+            if (parser->failed) {
+                expr_free(element);
+                expr_free(literal);
+                return NULL;
+            }
+            literal->arguments[literal->argument_count++] = element;
+        } while (match(parser, TOKEN_COMMA));
+    }
+
+    if (!consume(parser, TOKEN_RBRACKET, "']' closing an array literal")) {
+        expr_free(literal);
+        return NULL;
+    }
+    if (literal->argument_count == 0) {
+        fail(parser, start, "an array literal must have at least one element");
+        expr_free(literal);
+        return NULL;
+    }
+    return parse_postfix(parser, literal);
+}
+
 static Expr *parse_primary(Parser *parser) {
     const Token *token = current(parser);
+
+    if (match(parser, TOKEN_LBRACKET)) {
+        parser->position--;   /* hand the '[' back to the literal parser */
+        return parse_array_literal(parser);
+    }
 
     /* `Allocator(bytes)` -- the constructor. Distinguished from the
      * `allocator(x) { }` block form, which is a statement, by being parsed
@@ -796,6 +899,27 @@ static Expr *parse_postfix(Parser *parser, Expr *base) {
         return parse_postfix(parser, literal);
     }
 
+    /* `expr[index]` -- an array element read. */
+    if (check(parser, TOKEN_LBRACKET)) {
+        advance_token(parser);
+        Expr *index = expr_new(parser, EXPR_INDEX, base->position);
+        if (index == NULL) {
+            expr_free(base);
+            return NULL;
+        }
+        index->left = base;
+        index->right = parse_expression(parser);
+        if (parser->failed) {
+            expr_free(index);
+            return NULL;
+        }
+        if (!consume(parser, TOKEN_RBRACKET, "']' after an array index")) {
+            expr_free(index);
+            return NULL;
+        }
+        return parse_postfix(parser, index);
+    }
+
     /* `expr Try` -- propagate the error from the enclosing function.
      *
      * Postfix rather than a `Try(expr)` prefix so there is exactly one spelling
@@ -1117,6 +1241,45 @@ static Expr *parse_assignment(Parser *parser) {
             }
             return node;
         }
+
+        /* `ident[index] = ...` -- an element assignment.
+         *
+         * The bracket alone does not make this a target: `table[0]` on its own
+         * is an ordinary read. So the index is parsed first and the `=` is
+         * checked afterwards, and a read simply rewinds and takes the ordinary
+         * path. */
+        if (parser->tokens[parser->position + 1].type == TOKEN_LBRACKET) {
+            size_t save = parser->position;
+
+            Expr *base = expr_new(parser, EXPR_IDENT, current(parser)->start);
+            if (base == NULL) return NULL;
+            base->name = copy_ident(advance_token(parser));
+
+            Expr *indexed = parse_postfix(parser, base);
+            if (parser->failed) {
+                expr_free(indexed);
+                return NULL;
+            }
+
+            if (match(parser, TOKEN_ASSIGN)) {
+                Expr *node = expr_new(parser, EXPR_ASSIGN, indexed->position);
+                if (node == NULL) {
+                    expr_free(indexed);
+                    return NULL;
+                }
+                node->left = indexed;
+                node->right = parse_assignment(parser);
+                if (parser->failed) {
+                    expr_free(node);
+                    return NULL;
+                }
+                return node;
+            }
+
+            /* A read. Rewound so the ordinary expression path parses it once,
+             * rather than keeping a half-parsed tree it would have to fix up. */
+            parser->position = save;
+        }
     }
 
     return parse_bitwise_or(parser);
@@ -1189,7 +1352,7 @@ static Stmt *parse_variable_declaration(Parser *parser) {
     stmt->name = copy_ident(name);
 
     if (!consume(parser, TOKEN_COLON, "':' after variable name") ||
-        !parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
+        !parse_type(parser, &stmt->declared_type, &stmt->type_name, &stmt->array)) {
         stmt_free(stmt);
         return NULL;
     }
@@ -1269,7 +1432,7 @@ static Stmt *parse_function_declaration(Parser *parser) {
             parameter->position = parameter_name->start;
 
             if (!consume(parser, TOKEN_COLON, "':' after parameter name") ||
-                !parse_type(parser, &parameter->type, &parameter->type_name)) {
+                !parse_type(parser, &parameter->type, &parameter->type_name, &parameter->array)) {
                 stmt_free(stmt);
                 return NULL;
             }
@@ -1294,7 +1457,7 @@ static Stmt *parse_function_declaration(Parser *parser) {
                 stmt_free(stmt);
                 return NULL;
             }
-        } else if (!parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
+        } else if (!parse_type(parser, &stmt->declared_type, &stmt->type_name, &stmt->array)) {
             stmt_free(stmt);
             return NULL;
         }
@@ -1468,14 +1631,14 @@ static Stmt *parse_aggregate(Parser *parser, DeclKind kind, TokenType keyword) {
 
         if (kind == DECL_STRUCT) {
             if (!consume(parser, TOKEN_COLON, "':' after a struct field name") ||
-                !parse_type(parser, &field->type, NULL)) {
+                !parse_type(parser, &field->type, NULL, NULL)) {
                 stmt_free(stmt);
                 return NULL;
             }
         } else if (match(parser, TOKEN_LPAREN)) {
             /* A union variant with a payload: Name(Type). */
             field->has_payload = true;
-            if (!parse_type(parser, &field->type, NULL)) {
+            if (!parse_type(parser, &field->type, NULL, NULL)) {
                 stmt_free(stmt);
                 return NULL;
             }
