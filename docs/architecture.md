@@ -84,13 +84,30 @@ and committing to them in a document is how projects die quietly.
 
 ### Phase 1 — Host and repository scaffolding (S)
 
-Decide the host language for the bootstrap interpreter and set up the repo.
+Set up the repository structure, the build, and the `siyana` entry point. The
+host language decision is already made (C, see decision 8), so this phase is
+mechanical.
+
+Proposed layout:
+
+```
+bootstrap/       C sources for the interpreter (through Phase 5)
+bootstrap/include/
+src/             Siyana Lang sources (empty until Phase 6)
+lib/             Siyana Lang standard library (empty until Phase 3)
+tests/           test suite
+tools/           build scripts
+docs/            this plan and future design docs
+research/        background material and decisions
+```
 
 **Exit criteria**
 
 - Repository builds from a clean clone with one documented command.
-- `siyana` binary runs and reports its version.
-- The decision about the host language is written down, with its reasoning.
+- `siyana --version` prints a version and exits zero.
+- The build works from a clean checkout with no manual setup beyond having a
+  C compiler.
+- `research/decisions.md` records the host language with reasoning — done.
 
 ### Phase 2 — Interpreter core (M)
 
@@ -209,10 +226,26 @@ rather than an afterthought. It is simpler, and the doubling is real but
 bounded — the interpreter is small relative to the compiler. Zig accepts the
 same cost permanently, which suggests it is tolerable.
 
-**[Unresolved]** The host language itself has not been chosen. C is the
-default candidate: it is available on every system that could plausibly run
-the build, and it is honest about what the project is. This decision is not
-recorded in the research folder yet and should be.
+**[Settled]** The host language is **C**. Verified available: GCC 13.2 and
+Clang 16, targeting `x86_64-w64-mingw32`, C11 builds clean. See
+[decision 8](../research/decisions.md) for the reasoning and the accepted
+costs.
+
+Path A is therefore the sequence: C interpreter first, ported to Siyana Lang
+in Phase 6.
+
+### Target sequence, and why it looks odd
+
+Starting with x86-64 rather than bare metal is deliberate. Bare metal means
+writing a bootloader and dealing with mode switching before the language can
+do anything observable — a long stretch of work with no feedback loop.
+Compiling to a hosted target first gives a working `siyana` run command
+immediately, and the *same* compiler code then emits freestanding binaries
+later. The architecture supports both; the sequence just front-loads the
+feedback.
+
+This means Phase 4 targets hosted x86-64 and Phase 7 introduces the freestanding
+path — the reverse of the end goal, and intentional.
 
 ## The allocator model
 
@@ -271,12 +304,28 @@ because it is fast enough to reach while the motivation is still intact.
 
 ## Open questions
 
-Not yet decided, and each blocks work:
+Not yet decided, and each blocks a specific phase:
 
-1. Host language for the bootstrap interpreter.
-2. Error handling detail: error unions versus an explicit result type.
-3. Compile-time evaluation design, and how much of it the language exposes.
-4. Whether closures are genuinely deferrable, or whether first-class function
-   pointers suffice.
-5. Module system: file-based, package-based, or both.
-6. Source file extension — `.sy` is a placeholder.
+| Question | Blocks | Why it blocks |
+| --- | --- | --- |
+| Allocator passing model | Phase 3 | The highest-risk item. Allocator plumbing shapes every function signature in the language. |
+| Error handling: error unions vs. explicit result type | Phase 3 | Determines how every fallible function is written and called. |
+| Compile-time evaluation design | Phase 3 | Interacts with generics and const sizing; retrofitting is expensive. |
+| Closures vs. first-class function pointers | Phase 3 | Closures are in the deferred list but this decides whether deferral is even possible. |
+| Module system | Phase 4 | Needed before the freestanding split. |
+| Source file extension | Phase 2 | Cosmetic, but cheap to settle now and annoying to change later. |
+
+**[Note]** Phase 1 is unblocked and can proceed immediately. Phase 2 needs only
+a narrow slice of the language — integers, `bool`, arithmetic, comparison,
+`if`, `while`, functions, variables — none of which depends on the open
+questions above.
+
+## What to do next
+
+Phase 1, then Phase 2. Neither is blocked.
+
+The recommendation is to settle the allocator and error-handling questions
+*during* Phase 3 rather than in advance of it, by writing the two or three
+prototype programs that would settle them and seeing which design survives
+contact with real code. Those questions are cheap to answer with a prototype
+and expensive to answer in the abstract.
