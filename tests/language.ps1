@@ -1425,6 +1425,62 @@ Terminal.Write(a.Text() == s);
     Test-Output $src @('5', 'True')
 }
 
+Test-Case 'a struct field may be another struct' {
+    # This did not work at all before the ownership pass: the field never
+    # recorded the name it was declared with, so there was nothing to check the
+    # value against and every value was refused.
+    $src = @'
+Struct Inner { x: Number, y: Number }
+Struct Outer { a: Inner, b: Number }
+Variable o: Outer = Outer { a: Inner { x: 1, y: 2 }, b: 3 };
+Terminal.Write(o.a.x);
+Terminal.Write(o.a.y);
+Terminal.Write(o.b);
+'@
+    Test-Output $src @('1', '2', '3')
+}
+Test-Case 'a nested struct field can be assigned' {
+    $src = @'
+Struct Inner { x: Number }
+Struct Outer { a: Inner }
+Variable o: Outer = Outer { a: Inner { x: 1 } };
+o.a = Inner { x: 9 };
+Terminal.Write(o.a.x);
+'@
+    Test-Output $src @('9')
+}
+Test-Case 'a nested struct copies deeply on assignment' {
+    # The copy must be deep: sharing the inner struct's fields would mean a
+    # write through either name changed both.
+    $src = @'
+Struct Inner { x: Number }
+Struct Outer { a: Inner }
+Variable one: Outer = Outer { a: Inner { x: 1 } };
+Variable two: Outer = one;
+two.a = Inner { x: 99 };
+Terminal.Write(one.a.x);
+Terminal.Write(two.a.x);
+'@
+    Test-Output $src @('1', '99')
+}
+Test-Case 'a nested struct field rejects the wrong type' {
+    $src = @'
+Struct Inner { x: Number }
+Struct Other { x: Number }
+Struct Outer { a: Inner }
+Variable o: Outer = Outer { a: Other { x: 1 } };
+'@
+    Test-Diagnostic $src "field 'a' of 'Outer' expects Inner, got a struct"
+}
+Test-Case 'a String field keeps its declared type' {
+    $src = @'
+Struct Line { text: String, width: Number }
+Variable l: Line = Line { text: "hi", width: 2 };
+Terminal.Write(l.text);
+'@
+    Test-Output $src @('hi')
+}
+
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {

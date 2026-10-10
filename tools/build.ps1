@@ -113,4 +113,17 @@ if ($Config -eq 'test' -or $Config -ne 'clean') {
         & $suite
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
+
+    # ---- Leak check ----------------------------------------------------------
+    # No sanitizer is available on this toolchain (no libclang_rt.asan), which is
+    # why the struct and array leak was recorded for so long as "reasoned from
+    # reading the code rather than measured". tools/leakcheck.ps1 measures it
+    # instead by linking a counting malloc through ld --wrap, and runs here on
+    # every build so the fix cannot silently regress.
+    #
+    # It builds its own binary into the temp directory rather than the build
+    # directory: it is instrumented, and putting an instrumented binary where the
+    # normal one lives invites shipping it by accident.
+    & (Join-Path $Root 'tools/leakcheck.ps1') -Quiet
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

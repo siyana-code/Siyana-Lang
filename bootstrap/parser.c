@@ -195,7 +195,10 @@ static void stmt_free(Stmt *stmt) {
     expr_free(stmt->initializer);
     stmt_free(stmt->else_branch);
 
-    for (size_t i = 0; i < stmt->field_count; i++) free(stmt->fields[i].name);
+    for (size_t i = 0; i < stmt->field_count; i++) {
+        free(stmt->fields[i].name);
+        free(stmt->fields[i].type_name);
+    }
     free(stmt->fields);
 
     for (size_t i = 0; i < stmt->arm_count; i++) {
@@ -1634,15 +1637,18 @@ static Stmt *parse_aggregate(Parser *parser, DeclKind kind, TokenType keyword) {
         stmt->field_count++;
 
         if (kind == DECL_STRUCT) {
+            /* The type name is recorded, not just the kind. Without it a field
+             * declared with another struct's name has nothing to be checked
+             * against, and `Struct Outer { inner: Inner }` cannot work. */
             if (!consume(parser, TOKEN_COLON, "':' after a struct field name") ||
-                !parse_type(parser, &field->type, NULL, NULL)) {
+                !parse_type(parser, &field->type, &field->type_name, NULL)) {
                 stmt_free(stmt);
                 return NULL;
             }
         } else if (match(parser, TOKEN_LPAREN)) {
             /* A union variant with a payload: Name(Type). */
             field->has_payload = true;
-            if (!parse_type(parser, &field->type, NULL, NULL)) {
+            if (!parse_type(parser, &field->type, &field->type_name, NULL)) {
                 stmt_free(stmt);
                 return NULL;
             }

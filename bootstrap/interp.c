@@ -128,10 +128,21 @@ static Scope *scope_create(Scope *parent) {
     return scope;
 }
 
-/* Frees exactly one scope and its entries, leaving `parent` untouched. */
+/* Defined with the value constructors, well below the scopes that use it. */
+static void value_free(Value *value);
+
+/* Frees exactly one scope and its entries, leaving `parent` untouched.
+ *
+ * A scope owns its entries' values: whatever evaluate() produced was handed
+ * here by scope_define or scope_assign, and is released now. This is the site
+ * that ends a block's and a function's value lifetimes -- which is what stops a
+ * loop that declares a struct on each pass from growing without bound. */
 static void scope_destroy(Scope *scope) {
     if (scope == NULL) return;
-    for (size_t i = 0; i < scope->count; i++) free(scope->entries[i].name);
+    for (size_t i = 0; i < scope->count; i++) {
+        value_free(&scope->entries[i].value);
+        free(scope->entries[i].name);
+    }
     free(scope->entries);
     free(scope);
 }
@@ -202,10 +213,16 @@ static Value *scope_find(Scope *scope, const char *name) {
     return NULL;
 }
 
+/* Overwrites a variable, taking ownership of `value`.
+ *
+ * The value being replaced is released first. Without this, reassigning a struct
+ * or an array drops the previous value's fields on the floor -- which is a leak
+ * on every reassignment, so a loop that reuses one variable grows unbounded. */
 static bool scope_assign(Scope *scope, const char *name, Value value) {
     for (; scope != NULL; scope = scope->parent) {
         for (size_t i = 0; i < scope->count; i++) {
             if (strcmp(scope->entries[i].name, name) == 0) {
+                value_free(&scope->entries[i].value);
                 scope->entries[i].value = value;
                 return true;
             }
@@ -363,25 +380,35 @@ static Value value_nil(void) {
 
 /* Defined with the aggregate helpers, but needed earlier for named-type
  * resolution in variable and parameter checks. */
+/* Defined below, and mutually recursive with value_copy: a struct's fields may
+ * themselves be structs or arrays. */
+static Value value_copy(Value value);
+
 /* Copies an aggregate value, allocating a fresh fields array.
  *
  * Structs are value types, so `b = a` must not leave `b` sharing `a`'s fields.
  * Without this copy, assigning through one variable silently changes the other,
- * which is the kind of aliasing bug that is very hard to find later. */
+ * which is the kind of aliasing bug that is very hard to find later.
+ *
+ * Each field is copied in turn rather than copied across flat. A struct holding
+ * another struct -- or an array -- therefore owns its innards too, which is what
+ * makes a deep free safe and what lets value_free be one recursive walk instead
+ * of a type-by-type case analysis. Copying flat here is what made a copied
+ * struct share its inner struct's fields. */
 static Value copy_aggregate(Value value) {
     Value copy = value;
     size_t count = value.as.aggregate.decl->node->field_count;
     copy.as.aggregate.fields = malloc(count * sizeof(Value));
     if (copy.as.aggregate.fields != NULL) {
         for (size_t i = 0; i < count; i++) {
-            copy.as.aggregate.fields[i] = value.as.aggregate.fields[i];
+            copy.as.aggregate.fields[i] = value_copy(value.as.aggregate.fields[i]);
         }
     }
     return copy;
 }
 
-/* Structs, unions, and arrays are value types: reading one out of a variable or
- * passing one to a function copies it. */
+/* Structs, unions, arrays, and Result payloads are value types: reading one out
+ * of a variable or passing one to a function copies it. */
 static Value value_copy(Value value) {
     if (value.type == VALUE_ARRAY) {
         Value copy = value;
@@ -397,7 +424,68 @@ static Value value_copy(Value value) {
     if (value.type == VALUE_STRUCT || value.type == VALUE_UNION) {
         return copy_aggregate(value);
     }
+    if (value.type == VALUE_RESULT && value.as.result.value != NULL) {
+        /* The payload is owned, so a copied Result owns a copied payload. Not
+         * doing this shares one payload between two Results, and freeing either
+         * would leave the other pointing at freed memory. */
+        Value copy = value;
+        copy.as.result.value = malloc(sizeof(Value));
+        if (copy.as.result.value != NULL) {
+            *copy.as.result.value = value_copy(*value.as.result.value);
+        }
+        return copy;
+    }
+    /* An Allocator is reference counted and deliberately aliases; a String's
+     * bytes live in the run's arena. Neither is copied. */
     return value;
+}
+
+/* Releases everything `value` owns, recursively.
+ *
+ * The single exit for every value produced by evaluate(). The rule the whole
+ * interpreter rests on is that evaluate() hands ownership to its caller: either
+ * value_free is called on the result, or it is stored where something will
+ * eventually call value_free on it -- a scope entry, a struct field, an array
+ * element, a Result payload.
+ *
+ * A String's bytes are NOT freed. They live in the run's arena (decision 27)
+ * and are released once at exit, so there is nothing per-value to release --
+ * and no borrowed-or-owned flag to check wrongly at a copy site, which is the
+ * defect this replaced. An Allocator is reference counted and released through
+ * its own path. */
+static void value_free(Value *value) {
+    switch (value->type) {
+        case VALUE_STRUCT:
+        case VALUE_UNION:
+            if (value->as.aggregate.fields != NULL) {
+                size_t count = value->as.aggregate.decl->node->field_count;
+                for (size_t i = 0; i < count; i++) {
+                    value_free(&value->as.aggregate.fields[i]);
+                }
+                free(value->as.aggregate.fields);
+                value->as.aggregate.fields = NULL;
+            }
+            break;
+        case VALUE_ARRAY:
+            if (value->as.array.elements != NULL) {
+                for (size_t i = 0; i < value->as.array.count; i++) {
+                    value_free(&value->as.array.elements[i]);
+                }
+                free(value->as.array.elements);
+                value->as.array.elements = NULL;
+            }
+            break;
+        case VALUE_RESULT:
+            if (value->as.result.value != NULL) {
+                value_free(value->as.result.value);
+                free(value->as.result.value);
+                value->as.result.value = NULL;
+            }
+            break;
+        default:
+            break;
+    }
+    *value = value_nil();
 }
 
 static const Decl *resolve_named(const InterpState *state, const char *name);
@@ -944,12 +1032,52 @@ static bool adopt_operand_type(const Expr *expression, Value *value,
     return true;
 }
 
+/* The body of evaluate_binary, taking ownership of both operands.
+ *
+ * Split out so the operands are released in exactly one place. Putting a release
+ * on each of this function's many returns is how one gets missed, and a release
+ * missed in an error path is a leak on precisely the runs that already failed for
+ * some other reason. */
+/* Both operand wrappers follow the same shape: evaluate, then release once the
+ * operation is done with them. A failure to evaluate the second operand still
+ * releases the first, which is the case a naive version drops on the floor.
+ * Each body is defined just after its wrapper's forward declaration. */
+static bool evaluate_binary_operands(InterpState *state, const Expr *expression,
+                                     Scope *scope, Value left, Value right,
+                                     Value *out);
+static bool evaluate_unary_operands(InterpState *state, const Expr *expression,
+                                    Scope *scope, Value operand, Value *out);
+
 static bool evaluate_binary(InterpState *state, const Expr *expression,
                             Scope *scope, Value *out) {
     Value left;
     Value right;
     if (!evaluate(state, expression->left, scope, &left)) return false;
-    if (!evaluate(state, expression->right, scope, &right)) return false;
+    if (!evaluate(state, expression->right, scope, &right)) {
+        value_free(&left);
+        return false;
+    }
+
+    bool ok = evaluate_binary_operands(state, expression, scope, left, right, out);
+    value_free(&left);
+    value_free(&right);
+    return ok;
+}
+
+static bool evaluate_unary(InterpState *state, const Expr *expression,
+                           Scope *scope, Value *out) {
+    Value operand;
+    if (!evaluate(state, expression->right, scope, &operand)) return false;
+
+    bool ok = evaluate_unary_operands(state, expression, scope, operand, out);
+    value_free(&operand);
+    return ok;
+}
+
+static bool evaluate_binary_operands(InterpState *state, const Expr *expression,
+                                     Scope *scope, Value left, Value right,
+                                     Value *out) {
+    (void)scope;   /* Both operands are already evaluated; nothing is looked up. */
 
     /* Contextual typing, applied before the operator is dispatched.
      *
@@ -1189,10 +1317,9 @@ static bool checked_negate(long long bits, TypeKind type, long long *out_result)
     *out_result = -bits;
     return true;
 }
-static bool evaluate_unary(InterpState *state, const Expr *expression,
-                            Scope *scope, Value *out) {
-    Value operand;
-    if (!evaluate(state, expression->right, scope, &operand)) return false;
+static bool evaluate_unary_operands(InterpState *state, const Expr *expression,
+                                    Scope *scope, Value operand, Value *out) {
+    (void)scope;   /* The operand is already evaluated; nothing is looked up. */
 
     if (expression->op == OP_NOT) {
         /* C semantics: !0 is 1, anything else is 0. */
@@ -1277,6 +1404,24 @@ static const Function *find_function(const InterpState *state, const char *name)
     return NULL;
 }
 
+/* Releases a call's evaluated arguments.
+ *
+ * Every argument is owned by the caller until something takes it. Most are taken
+ * by scope_define inside the callee's scope, which releases them when it returns;
+ * the rest -- an ambient builtin with no scope, or a call that failed before the
+ * callee was entered -- are released here. The array is calloc'd, so an argument
+ * that was never evaluated is `nothing` and releases as a no-op.
+ *
+ * A separate function so that every exit from the call path reaches it, including
+ * the ones a later edit might add. */
+static void free_arguments(Value *arguments, size_t from, size_t count) {
+    if (arguments == NULL) return;
+    for (size_t i = from; i < count; i++) value_free(&arguments[i]);
+    free(arguments);
+}
+
+/* Always consumes `arguments` -- including on the returns below -- so the caller
+ * never has to know which of its arguments reached a scope and which did not. */
 static bool call_function(InterpState *state, const Function *function,
                           Value *arguments, size_t argument_count, Value *out) {
     const Stmt *declaration = function->declaration;
@@ -1286,12 +1431,14 @@ static bool call_function(InterpState *state, const Function *function,
              "function '%s' expects %zu argument%s, got %zu",
              declaration->name, declaration->parameter_count,
              declaration->parameter_count == 1 ? "" : "s", argument_count);
+        free_arguments(arguments, 0, argument_count);
         return false;
     }
 
     Scope *call_scope = scope_create(function->closure);
     if (call_scope == NULL) {
         fail(state, declaration->position, "out of memory");
+        free_arguments(arguments, 0, argument_count);
         return false;
     }
 
@@ -1364,8 +1511,14 @@ static bool call_function(InterpState *state, const Function *function,
         if (!scope_define(call_scope, parameter->name, value_copy(argument))) {
             fail(state, parameter->position, "out of memory");
             scope_destroy(call_scope);
+            free_arguments(arguments, i, argument_count);
             return false;
         }
+        /* The scope holds a *copy*, so the caller's argument is still owned here
+         * and has to be released. Without this the whole array leaked once per
+         * call -- the largest of the leaks this pass closes, because a call is
+         * the most common way a value is created. */
+        value_free(&arguments[i]);
     }
 
     const Stmt *enclosing = state->current_function;
@@ -1415,6 +1568,12 @@ static bool call_function(InterpState *state, const Function *function,
 
     state->current_function = enclosing;
     scope_destroy(call_scope);
+
+    /* The array itself. Every argument's value was already released above, on the
+     * way into the scope, so only the block is left. Missing this leaked one
+     * block per call for the whole run -- which is what the leak checker caught
+     * on the `call-arg` case after every other path was clean. */
+    free(arguments);
     return true;
 }
 
@@ -1527,6 +1686,10 @@ static bool evaluate_builtin(InterpState *state, const Expr *expression,
             Value argument;
             if (!evaluate(state, expression->arguments[i], scope, &argument)) return false;
             write_value(argument);
+            /* Released after printing, not before: `Terminal.Write(p)` where p is
+             * a struct prints p's fields, and those are reachable only through
+             * this value. */
+            value_free(&argument);
         }
 
         /* Terminal.Write appends a newline, matching a shell that writes one
@@ -1649,11 +1812,22 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
     }
 
     if (ok) {
-        ok = ambient
-                 ? evaluate_ambient_allocate(state, expression, scope, out)
-                 : call_function(state, function, arguments, expression->argument_count, out);
+        if (ambient) {
+            /* No parameters, so no scope took them. */
+            ok = evaluate_ambient_allocate(state, expression, scope, out);
+            free_arguments(arguments, 0, expression->argument_count);
+            arguments = NULL;
+        } else {
+            /* call_function always consumes the array, including on its own
+             * early returns, so nothing is released here. */
+            ok = call_function(state, function, arguments,
+                               expression->argument_count, out);
+            arguments = NULL;
+        }
     }
-    free(arguments);
+    /* Reached only when argument evaluation failed partway, or when the ambient
+     * path above already consumed the array. */
+    free_arguments(arguments, 0, expression->argument_count);
     if (!ok) return false;
 
     /* Rule 1: a call that can fail must be handled at the point of the call.
@@ -1763,10 +1937,13 @@ static bool evaluate_allocator_new(InterpState *state, const Expr *expression,
     if (!evaluate(state, expression->right, scope, &capacity)) return false;
 
     long long bytes = 0;
-    if (!require_word(state, "an Allocator's capacity", expression->position,
-                      capacity, &bytes)) {
-        return false;
-    }
+    /* Read and released on every path. The capacity is an owned value; a Word
+     * needs no release, but the early returns below must not be able to leak one
+     * if this ever stops being a Word. */
+    bool usable = require_word(state, "an Allocator's capacity",
+                               expression->position, capacity, &bytes);
+    value_free(&capacity);
+    if (!usable) return false;
     if (bytes == 0) {
         fail(state, expression->position, "an Allocator's capacity must be greater than zero");
         return false;
@@ -1985,9 +2162,9 @@ static bool evaluate_ambient_allocate(InterpState *state, const Expr *expression
     Value size;
     if (!evaluate(state, expression->arguments[0], scope, &size)) return false;
     long long requested = 0;
-    if (!require_word(state, "Allocate", expression->position, size, &requested)) {
-        return false;
-    }
+    bool usable = require_word(state, "Allocate", expression->position, size, &requested);
+    value_free(&size);
+    if (!usable) return false;
 
     size_t offset = 0;
     if (!allocator_allocate(state->current_allocator, (size_t)requested, &offset)) {
@@ -2018,6 +2195,59 @@ static long long find_field(const Decl *decl, const char *name) {
         if (strcmp(decl->node->fields[i].name, name) == 0) return (long long)i;
     }
     return -1;
+}
+
+/* Checks a value against a struct field's declared type.
+ *
+ * One place, because the rule is the same in a literal and in an assignment, and
+ * the rule as it was written had the same blind spot in both: it only knew how
+ * to compare a primitive kind, so a field declared with another struct's name --
+ * or with `String` -- was refused even when the value was exactly that type.
+ * `Struct Outer { inner: Inner }` did not work at all, because the field never
+ * recorded the name there was nothing to check against.
+ *
+ * A struct or union is compared by identity against its declaration rather than
+ * by name, for the reason a variable initialiser does it that way: two
+ * aggregates with the same field names are still distinct types.
+ *
+ * On success `*out` holds the value to store -- narrowed if a Number literal had
+ * to become something narrower -- and ownership passes to the caller. */
+static bool field_accepts(InterpState *state, Value value, const Field *field,
+                          const Decl *decl, Position position,
+                          Value *out) {
+    if (field->type == TYPE_NAMED) {
+        const Decl *wanted = resolve_named(state, field->type_name);
+        if (wanted == NULL) {
+            fail(state, position, "undefined type '%s'", field->type_name);
+            return false;
+        }
+        if (value.type != (wanted->is_union ? VALUE_UNION : VALUE_STRUCT) ||
+            value.as.aggregate.decl != wanted) {
+            fail(state, position, "field '%s' of '%s' expects %s, got %s",
+                 field->name, decl->node->name, field->type_name,
+                 type_name_of(value));
+            return false;
+        }
+        *out = value;
+        return true;
+    }
+
+    if (value_matches_type(value, field->type)) {
+        *out = value;
+        return true;
+    }
+
+    /* A Number literal narrows when it fits, and crosses no other boundary. */
+    if (value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER &&
+        integer_fits(value.as.integer.bits, field->type)) {
+        *out = value_integer(value.as.integer.bits, field->type);
+        return true;
+    }
+
+    fail(state, position, "field '%s' of '%s' expects %s, got %s",
+         field->name, decl->node->name, type_kind_name(field->type),
+         type_name_of(value));
+    return false;
 }
 
 static void free_aggregate_fields(Value *value) {
@@ -2097,21 +2327,12 @@ static bool evaluate_struct_init(InterpState *state, const Expr *expression,
         }
 
         /* Field types are enforced, which is what stops a struct from quietly
-         * holding a Character where a Word is declared. */
-        TypeKind expected = decl->node->fields[index].type;
-        if (!value_matches_type(value, expected)) {
-            if (value.type == VALUE_INTEGER &&
-                value.as.integer.type == TYPE_NUMBER &&
-                integer_fits(value.as.integer.bits, expected)) {
-                value = value_integer(value.as.integer.bits, expected);
-            } else {
-                fail(state, field->position,
-                     "field '%s' of '%s' expects %s, got %s",
-                     field->name, expression->name,
-                     type_kind_name(expected), type_name_of(value));
-                free_aggregate_fields(&result);
-                return false;
-            }
+         * holding a Character where a Word is declared -- or a String where a
+         * struct is declared, which the flat check could not see at all. */
+        if (!field_accepts(state, value, &decl->node->fields[index], decl,
+                           field->position, &value)) {
+            free_aggregate_fields(&result);
+            return false;
         }
         result.as.aggregate.fields[index] = value;
     }
@@ -2210,6 +2431,10 @@ static bool evaluate_union_init(InterpState *state, const Expr *expression,
  * Both have the same syntax, so this resolves the ambiguity once the left side
  * is known: a type name means a union construction, a value means a field read.
  * Doing it here rather than in the parser is the only place the answer exists. */
+/* Defined below; evaluate_field appears first in the file. */
+static bool evaluate_field_on(InterpState *state, const Expr *expression,
+                              Scope *scope, Value base, Value *out);
+
 static bool evaluate_field(InterpState *state, const Expr *expression,
                            Scope *scope, Value *out) {
     /* A union construction when the left side names a type rather than a
@@ -2225,47 +2450,65 @@ static bool evaluate_field(InterpState *state, const Expr *expression,
 
     Value base;
     if (!evaluate(state, expression->left, scope, &base)) return false;
+    return evaluate_field_on(state, expression, scope, base, out);
+}
 
+/* `base` is this function's own copy of the receiver, released on every exit.
+ * It cannot be released up front: `p.Length()`, `bytes.Text()` and
+ * `alloc.Used()` all read through it. The struct-field path copies the field out
+ * before the release, so the result never points into memory that has gone. */
+static bool evaluate_field_on(InterpState *state, const Expr *expression,
+                              Scope *scope, Value base, Value *out) {
     if (base.type == VALUE_UNION) {
         fail(state, expression->position,
              "cannot read field '%s' from the union '%s'; use Match to read its variant",
              expression->name, base.as.aggregate.decl->node->name);
+        value_free(&base);
         return false;
     }
 
     if (base.type != VALUE_STRUCT) {
+        bool ok;
         if (base.type == VALUE_STRING) {
-            return evaluate_string_method(state, expression, &base, out);
-        }
-        if (base.type == VALUE_ALLOCATOR) {
+            ok = evaluate_string_method(state, expression, &base, out);
+        } else if (base.type == VALUE_ALLOCATOR) {
             /* A method call, dispatched by the receiver's type. `a.Allocate` and
              * `Value.Number` are the same three tokens; only the receiver
              * distinguishes them. */
-            return evaluate_allocator_method(state, expression, scope,
-                                            base.as.allocator, out);
-        }
-        if (base.type == VALUE_ARRAY) {
+            ok = evaluate_allocator_method(state, expression, scope,
+                                           base.as.allocator, out);
+        } else if (base.type == VALUE_ARRAY) {
             /* `Text` is dispatched here for every array, not just a Character
              * one, so that calling it on the wrong element type says what the
              * element type is rather than that no such method exists. */
             if (strcmp(expression->name, "Text") == 0) {
-                return evaluate_array_text(state, expression, &base, out);
+                ok = evaluate_array_text(state, expression, &base, out);
+            } else {
+                ok = evaluate_array_method(state, expression, scope, &base, out);
             }
-            return evaluate_array_method(state, expression, scope, &base, out);
+        } else {
+            fail(state, expression->position,
+                 "cannot read field '%s' from %s", expression->name,
+                 type_name_of(base));
+            ok = false;
         }
-        fail(state, expression->position,
-             "cannot read field '%s' from %s", expression->name, type_name_of(base));
-        return false;
+        value_free(&base);
+        return ok;
     }
 
     long long index = find_field(base.as.aggregate.decl, expression->name);
     if (index < 0) {
         fail(state, expression->position, "'%s' has no field '%s'",
              base.as.aggregate.decl->node->name, expression->name);
+        value_free(&base);
         return false;
     }
 
-    *out = base.as.aggregate.fields[index];
+    /* Copied, not aliased: the field belongs to `base`, which is released on the
+     * next line. Handing it on directly would leave the caller pointing into a
+     * copy nobody owns. */
+    *out = value_copy(base.as.aggregate.fields[index]);
+    value_free(&base);
     return true;
 }
 
@@ -2315,7 +2558,10 @@ static bool make_array(InterpState *state, size_t count, TypeKind element_type,
  *
  * A struct or union element is compared by identity against its declaration
  * rather than by type name, for the same reason a variable initialiser does it
- * that way: two aggregates with the same field names are still distinct. */
+ * that way: two aggregates with the same field names are still distinct.
+ *
+ * On success `*out` holds the value to store, narrowed if a Number literal had
+ * to become something narrower, and ownership of it passes to the caller. */
 static bool array_element_fits(InterpState *state, Value value, TypeKind element,
                                const char *element_name, Position position,
                                const char *where, Value *out) {
@@ -2398,23 +2644,26 @@ static bool evaluate_array_declaration(InterpState *state, const Expr *initializ
      * would quietly re-type every element it holds. */
     Value source;
     if (!evaluate(state, initializer, scope, &source)) return false;
+
+    /* `source` is only read to check its shape; the copy is what gets stored, so
+     * the original is released rather than becoming a second owner. Checked into
+     * one flag so every failure path releases it exactly once. */
+    bool usable = true;
     if (source.type != VALUE_ARRAY) {
         fail(state, initializer->position, "cannot initialise an array with %s",
              type_name_of(source));
-        return false;
-    }
-    if (source.as.array.count != declaration->array.length) {
+        usable = false;
+    } else if (source.as.array.count != declaration->array.length) {
         fail(state, initializer->position,
              "this array holds %zu element(s) but %zu were given",
              declaration->array.length, source.as.array.count);
-        return false;
-    }
-    if (source.as.array.element_type != declaration->array.element ||
-        (declaration->array.element == TYPE_NAMED &&
-         strcmp(source.as.array.element_type_name == NULL ? "" :
-                source.as.array.element_type_name,
-                declaration->array.element_name == NULL ? "" :
-                declaration->array.element_name) != 0)) {
+        usable = false;
+    } else if (source.as.array.element_type != declaration->array.element ||
+               (declaration->array.element == TYPE_NAMED &&
+                strcmp(source.as.array.element_type_name == NULL ? "" :
+                       source.as.array.element_type_name,
+                       declaration->array.element_name == NULL ? "" :
+                       declaration->array.element_name) != 0)) {
         fail(state, initializer->position,
              "this array holds %s but %zu %s were given",
              source.as.array.element_type == TYPE_NAMED
@@ -2424,9 +2673,15 @@ static bool evaluate_array_declaration(InterpState *state, const Expr *initializ
              declaration->array.element == TYPE_NAMED
                  ? declaration->array.element_name
                  : type_kind_name(declaration->array.element));
+        usable = false;
+    }
+    if (!usable) {
+        value_free(&source);
         return false;
     }
+
     *out = value_copy(source);
+    value_free(&source);
     return true;
 }
 
@@ -2441,28 +2696,36 @@ static bool array_index_of(InterpState *state, const Expr *expression, Scope *sc
     Value index;
     if (!evaluate(state, expression->right, scope, &index)) return false;
 
+    /* Checked into locals and released once, so none of the three failure paths
+     * can each forget. */
+    bool usable = true;
+    long long position = 0;
+
     if (index.type != VALUE_INTEGER) {
         fail(state, expression->position, "an array index must be an integer, got %s",
              type_name_of(index));
-        return false;
-    }
-
-    long long position = index.as.integer.bits;
-    if (index.as.integer.type != TYPE_WORD) {
-        if (index.as.integer.type == TYPE_NUMBER && position >= 0) {
+        usable = false;
+    } else {
+        position = index.as.integer.bits;
+        if (index.as.integer.type != TYPE_WORD) {
             /* A Number literal index is fine; it is a count, not data. */
-        } else {
-            fail(state, expression->position, "an array index must not be negative");
-            return false;
+            if (index.as.integer.type != TYPE_NUMBER || position < 0) {
+                fail(state, expression->position,
+                     "an array index must not be negative");
+                usable = false;
+            }
+        }
+        if (usable &&
+            (unsigned long long)position >= (unsigned long long)array->as.array.count) {
+            fail(state, expression->position,
+                 "index %lld is outside this array of %zu element(s)",
+                 position, array->as.array.count);
+            usable = false;
         }
     }
 
-    if ((unsigned long long)position >= (unsigned long long)array->as.array.count) {
-        fail(state, expression->position,
-             "index %lld is outside this array of %zu element(s)",
-             position, array->as.array.count);
-        return false;
-    }
+    value_free(&index);
+    if (!usable) return false;
 
     *out = (size_t)position;
     return true;
@@ -2523,25 +2786,30 @@ static bool evaluate_string_index(InterpState *state, const Expr *expression,
                                   Scope *scope, const Value *string, Value *out) {
     Value index;
     if (!evaluate(state, expression->right, scope, &index)) return false;
+
+    bool usable = true;
+    long long at = 0;
     if (index.type != VALUE_INTEGER) {
         fail(state, expression->position, "a String index must be an integer, got %s",
              type_name_of(index));
-        return false;
-    }
-
-    long long at = index.as.integer.bits;
-    if (index.as.integer.type != TYPE_WORD) {
-        if (index.as.integer.type != TYPE_NUMBER || at < 0) {
+        usable = false;
+    } else {
+        at = index.as.integer.bits;
+        if (index.as.integer.type != TYPE_WORD &&
+            (index.as.integer.type != TYPE_NUMBER || at < 0)) {
             fail(state, expression->position, "a String index must not be negative");
-            return false;
+            usable = false;
+        } else if ((unsigned long long)at >=
+                   (unsigned long long)string->as.string.length) {
+            fail(state, expression->position,
+                 "index %lld is outside this String of %zu byte(s)",
+                 at, string->as.string.length);
+            usable = false;
         }
     }
-    if ((unsigned long long)at >= (unsigned long long)string->as.string.length) {
-        fail(state, expression->position,
-             "index %lld is outside this String of %zu byte(s)",
-             at, string->as.string.length);
-        return false;
-    }
+
+    value_free(&index);
+    if (!usable) return false;
 
     *out = value_integer((unsigned char)string->as.string.chars[at], TYPE_CHARACTER);
     return true;
@@ -2588,27 +2856,39 @@ static bool evaluate_array_text(InterpState *state, const Expr *expression,
     return ok;
 }
 
-/* `expr[index]` -- an element read. */
+/* `expr[index]` -- an element read. `target` is this function's own copy of the
+ * array or String, released on every exit. The element is copied out first, so
+ * the result never points into memory that is about to go away. */
 static bool evaluate_index(InterpState *state, const Expr *expression, Scope *scope,
                            Value *out) {
     Value target;
     if (!evaluate(state, expression->left, scope, &target)) return false;
+
     if (target.type == VALUE_STRING) {
         /* A String indexes to a Character rather than to a String of length 1.
          * The byte is the useful thing -- it is what a byte buffer is made of,
          * and what `name[i] == '/'` tests a path with. */
-        return evaluate_string_index(state, expression, scope, &target, out);
+        bool ok = evaluate_string_index(state, expression, scope, &target, out);
+        value_free(&target);
+        return ok;
     }
+
     if (target.type != VALUE_ARRAY) {
         fail(state, expression->position,
              "cannot index %s", type_name_of(target));
+        value_free(&target);
         return false;
     }
 
     size_t position = 0;
-    if (!array_index_of(state, expression, scope, &target, &position)) return false;
-    *out = value_copy(target.as.array.elements[position]);
-    return true;
+    bool in_range = array_index_of(state, expression, scope, &target, &position);
+    if (in_range) {
+        /* Copied before the array is released: the element belongs to this
+         * function's copy, not to the variable it came from. */
+        *out = value_copy(target.as.array.elements[position]);
+    }
+    value_free(&target);
+    return in_range;
 }
 
 /* `array[index] = value` -- an element assignment.
@@ -2616,6 +2896,15 @@ static bool evaluate_index(InterpState *state, const Expr *expression, Scope *sc
  * Reached through the variable's storage rather than a copy, for the same
  * reason field assignment does: writing into a copy would discard the write,
  * and copying on read would make the write visible through both names. */
+/* `array[index] = value` -- an element assignment.
+ *
+ * Reached through the variable's storage rather than a copy, for the same reason
+ * field assignment does: writing into a copy would discard the write, and copying
+ * on read would make the write visible through both names.
+ *
+ * Takes ownership of `value` on success -- the slot holds it afterwards -- and
+ * leaves it to the caller on every failure path, which is why each of those
+ * returns before the store. */
 static bool assign_index(InterpState *state, const Expr *expression, Scope *scope,
                          Value value) {
     const Expr *index = expression->left;
@@ -2644,6 +2933,9 @@ static bool assign_index(InterpState *state, const Expr *expression, Scope *scop
                             "an array element", &value)) {
         return false;
     }
+    /* The element being replaced is released first, or reassigning one slot in
+     * a loop grows the array's contents without bound. */
+    value_free(&array->elements[position]);
     array->elements[position] = value;
     return true;
 }
@@ -2686,18 +2978,14 @@ static bool assign_field(InterpState *state, const Expr *expression,
 
     /* The declared field type is enforced on assignment as well as on
      * construction, so a field cannot change type midway through a program. */
-    TypeKind expected = stored->as.aggregate.decl->node->fields[index].type;
-    if (!value_matches_type(value, expected)) {
-        if (value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER &&
-            integer_fits(value.as.integer.bits, expected)) {
-            value = value_integer(value.as.integer.bits, expected);
-        } else {
-            fail(state, expression->position, "field '%s' expects %s, got %s",
-                 field->name, type_kind_name(expected), type_name_of(value));
-            return false;
-        }
+    if (!field_accepts(state, value, &stored->as.aggregate.decl->node->fields[index],
+                       stored->as.aggregate.decl, expression->position, &value)) {
+        return false;
     }
 
+    /* The field being replaced is released before the new value lands, or
+     * assigning one field in a loop drops the previous one every time. */
+    value_free(&stored->as.aggregate.fields[index]);
     stored->as.aggregate.fields[index] = value;
     return true;
 }
@@ -3074,7 +3362,12 @@ static bool evaluate(InterpState *state, const Expr *expression,
         case EXPR_IDENT: {
             Value found;
             if (scope_get(scope, expression->name, &found)) {
-                *out = found;
+                /* Copied, not aliased. Every value evaluate() produces is owned
+                 * by its caller, and that only holds if reading a variable hands
+                 * back something the reader may release. Returning the
+                 * variable's own storage would make each release below either a
+                 * double free or a leak, depending on which one it was. */
+                *out = value_copy(found);
                 return true;
             }
             fail(state, expression->position, "undefined variable '%s'", expression->name);
@@ -3092,7 +3385,12 @@ static bool evaluate(InterpState *state, const Expr *expression,
             if (!evaluate(state, expression->right, scope, &value)) return false;
 
             if (expression->left != NULL) {
-                /* A field or element assignment; an OS does both constantly. */
+                /* A field or element assignment; an OS does both constantly.
+                 *
+                 * The value moves into the target, which now owns it. The
+                 * expression still yields a value, and it yields a copy --
+                 * returning the same one would make the statement loop's release
+                 * a release of what the variable now holds. */
                 bool assigned;
                 if (expression->left->type == EXPR_INDEX) {
                     assigned = assign_index(state, expression, scope, value);
@@ -3100,7 +3398,7 @@ static bool evaluate(InterpState *state, const Expr *expression,
                     assigned = assign_field(state, expression, scope, value);
                 }
                 if (!assigned) return false;
-                *out = value;
+                *out = value_copy(value);
                 return true;
             }
 
@@ -3113,7 +3411,7 @@ static bool evaluate(InterpState *state, const Expr *expression,
                      "undefined variable '%s'", expression->name);
                 return false;
             }
-            *out = value;
+            *out = value_copy(value);
             return true;
         }
 
@@ -3171,6 +3469,92 @@ static bool execute_block(InterpState *state, Stmt *const *body, size_t count,
     return true;
 }
 
+/* The body of STMT_MATCH, taking ownership of the subject.
+ *
+ * Split out so the subject is released once, rather than at each of this arm's
+ * returns -- which is how a double free gets introduced later, by adding an
+ * early return and forgetting it. */
+static bool execute_match(InterpState *state, const Stmt *statement, Scope *scope,
+                          Flow *flow, Value subject) {
+    if (subject.type != VALUE_UNION) {
+        fail(state, statement->position,
+             "Match needs a union value, got %s", type_name_of(subject));
+        value_free(&subject);
+        return false;
+    }
+
+    const Decl *decl = subject.as.aggregate.decl;
+    long long active = subject.as.aggregate.tag;
+
+    /* The declared type name on the Match must match the value's, so a typo in
+     * an arm is an error rather than a dead branch. */
+    if (statement->name != NULL &&
+        strcmp(statement->name, decl->node->name) != 0) {
+        fail(state, statement->position,
+             "Match arms name '%s' but the value is a '%s'",
+             statement->name, decl->node->name);
+        value_free(&subject);
+        return false;
+    }
+
+    for (size_t i = 0; i < statement->arm_count; i++) {
+        const MatchArm *arm = &statement->arms[i];
+        long long index = find_field(decl, arm->variant);
+        if (index < 0) {
+            fail(state, arm->position, "'%s' has no variant '%s'",
+                 decl->node->name, arm->variant);
+            value_free(&subject);
+            return false;
+        }
+        if (index != active) continue;
+
+        /* The matched arm gets its own scope, and the payload is bound to the
+         * arm's name when it asked for one. */
+        Scope *inner = scope_create(scope);
+        if (inner == NULL) {
+            fail(state, arm->position, "out of memory");
+            value_free(&subject);
+            return false;
+        }
+
+        const Field *variant = &decl->node->fields[index];
+        if (arm->binding != NULL) {
+            if (!variant->has_payload) {
+                fail(state, arm->position,
+                     "variant '%s' has no payload to bind to '%s'",
+                     arm->variant, arm->binding);
+                scope_destroy(inner);
+                value_free(&subject);
+                return false;
+            }
+            /* Copied into the binding. The arm's scope owns what it defines and
+             * releases it when the arm ends, so handing it the subject's own
+             * payload would release one value twice. */
+            if (!scope_define(inner, arm->binding,
+                              value_copy(subject.as.aggregate.fields[index]))) {
+                fail(state, arm->position, "out of memory");
+                scope_destroy(inner);
+                value_free(&subject);
+                return false;
+            }
+        }
+
+        bool ok = execute_block(state, arm->body, arm->body_count, inner, flow);
+        scope_destroy(inner);
+        value_free(&subject);
+        return ok;
+    }
+
+    /* No arm handled the active variant. This is the check decision 22 exists
+     * for: it runs when the Match is reached, not only at parse time, so a value
+     * built dynamically still cannot fall through silently. */
+    fail(state, statement->position,
+         "Match on '%s' is not exhaustive: no arm handles variant '%s'",
+         decl->node->name, decl->node->fields[active].name);
+    value_free(&subject);
+    return false;
+}
+
 static bool execute_statement(InterpState *state, const Stmt *statement,
                               Scope *scope, Flow *flow) {
     /* Once an error is propagating, this function is on its way out. No further
@@ -3182,8 +3566,16 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
 
     switch (statement->type) {
         case STMT_EXPR: {
+            /* An expression statement discards its value, and discarding has to
+             * mean releasing -- not merely ignoring. `Terminal.Write(P{x:1})`
+             * or a bare call returning a struct would otherwise leak once per
+             * occurrence for the whole run. */
             Value ignored;
-            return evaluate(state, statement->expression, scope, &ignored);
+            if (!evaluate(state, statement->expression, scope, &ignored)) {
+                return false;
+            }
+            value_free(&ignored);
+            return true;
         }
 
         case STMT_VARIABLE: {
@@ -3236,6 +3628,7 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                     if (decl == NULL) {
                         fail(state, statement->position,
                              "undefined type '%s'", statement->type_name);
+                        value_free(&initial);
                         return false;
                     }
                     if (initial.type != (decl->is_union ? VALUE_UNION : VALUE_STRUCT) ||
@@ -3244,6 +3637,7 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                              "cannot initialise '%s' of type %s with %s",
                              statement->name, statement->type_name,
                              type_name_of(initial));
+                        value_free(&initial);
                         return false;
                     }
                 } else if (!value_matches_type(initial, expected)) {
@@ -3261,6 +3655,7 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                              "cannot initialise '%s' of type %s with %s",
                              statement->name, type_kind_name(expected),
                              type_name_of(initial));
+                        value_free(&initial);
                         return false;
                     }
                 }
@@ -3269,13 +3664,20 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             if (scope_contains(scope, statement->name)) {
                 fail(state, statement->position, "'%s' is already declared in this scope",
                      statement->name);
+                value_free(&initial);
                 return false;
             }
-            /* Copied, so `Variable b: P = a` does not leave b sharing a's fields.
-             * Structs and unions are value types; without this, assigning a
-             * field through either variable changes both. */
-            if (!scope_define(scope, statement->name, value_copy(initial))) {
+            /* Ownership moves to the scope -- no copy.
+             *
+             * `Variable b: P = a` still cannot leave b sharing a's fields, but
+             * that is already guaranteed one level up: reading `a` hands back a
+             * value_copy of the variable's own storage. Copying again here
+             * allocated a second copy of every struct and array initialised by a
+             * declaration and then dropped the first, which was one leak per
+             * declaration -- the largest remaining leak after the call path. */
+            if (!scope_define(scope, statement->name, initial)) {
                 fail(state, statement->position, "out of memory");
+                value_free(&initial);
                 return false;
             }
             return true;
@@ -3300,13 +3702,19 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             /* C-style truthiness (decision 17): any integer, zero being False.
              * A String condition is a type error, since there is no reasonable
              * reading of `If ("x")`. */
+            /* Read once and released before either branch runs -- holding it across the
+             * branch's own allocations would buy nothing. */
             if (condition.type != VALUE_INTEGER) {
                 fail(state, statement->position,
                      "condition of 'If' must be an integer, got %s",
                      type_name_of(condition));
+                value_free(&condition);
                 return false;
             }
-            if (is_truthy(condition)) {
+            bool taken = is_truthy(condition);
+            value_free(&condition);
+
+            if (taken) {
                 return execute_block(state, statement->then_body, statement->then_count,
                                      scope, flow);
             }
@@ -3324,9 +3732,14 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                     fail(state, statement->position,
                          "condition of 'Loop' must be an integer, got %s",
                          type_name_of(condition));
+                    value_free(&condition);
                     return false;
                 }
-                if (!is_truthy(condition)) break;
+                /* Released each pass, so a loop's condition does not accumulate
+                 * one owned value per iteration. */
+                bool again = is_truthy(condition);
+                value_free(&condition);
+                if (!again) break;
 
                 Scope *inner = scope_create(scope);
                 if (inner == NULL) {
@@ -3443,73 +3856,7 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
         case STMT_MATCH: {
             Value subject;
             if (!evaluate(state, statement->expression, scope, &subject)) return false;
-
-            if (subject.type != VALUE_UNION) {
-                fail(state, statement->position,
-                     "Match needs a union value, got %s", type_name_of(subject));
-                return false;
-            }
-
-            const Decl *decl = subject.as.aggregate.decl;
-            long long active = subject.as.aggregate.tag;
-
-            /* The declared type name on the Match must match the value's, so a
-             * typo in an arm is an error rather than a dead branch. */
-            if (statement->name != NULL &&
-                strcmp(statement->name, decl->node->name) != 0) {
-                fail(state, statement->position,
-                     "Match arms name '%s' but the value is a '%s'",
-                     statement->name, decl->node->name);
-                return false;
-            }
-
-            for (size_t i = 0; i < statement->arm_count; i++) {
-                const MatchArm *arm = &statement->arms[i];
-                long long index = find_field(decl, arm->variant);
-                if (index < 0) {
-                    fail(state, arm->position, "'%s' has no variant '%s'",
-                         decl->node->name, arm->variant);
-                    return false;
-                }
-                if (index != active) continue;
-
-                /* The matched arm gets its own scope, and the payload is bound
-                 * to the arm's name when it asked for one. */
-                Scope *inner = scope_create(scope);
-                if (inner == NULL) {
-                    fail(state, arm->position, "out of memory");
-                    return false;
-                }
-
-                const Field *variant = &decl->node->fields[index];
-                if (arm->binding != NULL) {
-                    if (!variant->has_payload) {
-                        fail(state, arm->position,
-                             "variant '%s' has no payload to bind to '%s'",
-                             arm->variant, arm->binding);
-                        scope_destroy(inner);
-                        return false;
-                    }
-                    if (!scope_define(inner, arm->binding,
-                                      subject.as.aggregate.fields[index])) {
-                        fail(state, arm->position, "out of memory");
-                        scope_destroy(inner);
-                        return false;
-                    }
-                }
-
-                bool ok = execute_block(state, arm->body, arm->body_count, inner, flow);
-                scope_destroy(inner);
-                return ok;
-            }
-
-            /* No arm matched. Exhaustiveness is checked when the Match is
-             * reached, not just at parse time, so a value built dynamically
-             * still cannot fall through silently. */
-            fail(state, statement->position,
-                 "Match on '%s' is not exhaustive: no arm handles variant '%s'",
-                 decl->node->name, decl->node->fields[active].name);
-            return false;
+            return execute_match(state, statement, scope, flow, subject);
         }
 
         case STMT_FUNCTION:
