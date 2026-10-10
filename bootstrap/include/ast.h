@@ -1,9 +1,8 @@
 /* ast.h -- syntax tree for Siyana Lang.
  *
- * Phase 2 covers the statement and expression forms listed in decision 13.
- * The tree is a plain tagged union over heap-allocated nodes: no arena yet,
- * because the language's own allocator model is a Phase 3 decision and this is
- * the C bootstrap, not Siyana Lang.
+ * Phase 3 covers Number and Character as the only primitive types, with every
+ * other type derived in the standard library. See
+ * research/design/type-system.md.
  */
 
 #ifndef SIYANA_AST_H
@@ -17,22 +16,24 @@
 typedef enum {
     /* Statements */
     STMT_EXPR,
-    STMT_VAR,
+    STMT_VARIABLE,
     STMT_BLOCK,
     STMT_IF,
-    STMT_WHILE,
+    STMT_LOOP,
     STMT_RETURN,
-    STMT_FN,
+    STMT_FUNCTION,
 
     /* Expressions */
-    EXPR_INT,
-    EXPR_BOOL,
+    EXPR_NUMBER,
+    EXPR_CHARACTER,
     EXPR_STRING,
+    EXPR_BOOL,
     EXPR_IDENT,
     EXPR_UNARY,
     EXPR_BINARY,
     EXPR_ASSIGN,
-    EXPR_CALL
+    EXPR_CALL,
+    EXPR_BUILTIN
 } NodeType;
 
 typedef enum {
@@ -52,22 +53,35 @@ typedef enum {
     OP_GREATER_EQUAL
 } Operator;
 
+/* The two primitive types. bool is not among them: it is Number restricted to
+ * 0 and 1, following C. That is a deliberate reduction in safety, recorded as
+ * decision 17. */
+typedef enum {
+    TYPE_NUMBER,
+    TYPE_CHARACTER
+} TypeKind;
+
+const char *type_kind_name(TypeKind type);
+
+typedef struct Expr Expr;
+typedef struct Stmt Stmt;
+
 /* A node carries both statement and expression fields because the union is
  * shared: STMT_EXPR and STMT_RETURN hold an Expr, and EXPR_CALL holds a Stmt*.
  * Separate structs would avoid the overlap but double the node count for
  * marginal benefit at this size. */
 
-typedef struct Expr Expr;
-typedef struct Stmt Stmt;
-
 typedef struct Expr {
     NodeType type;
     Position position;
 
-    /* Literals */
-    long long integer;
+    /* EXPR_NUMBER */
+    long long number;
+    /* EXPR_BOOL */
     bool boolean;
-    char *string;          /* EXPR_STRING: owned */
+    /* EXPR_CHARACTER, EXPR_STRING: owned */
+    char *text;
+    size_t text_length;
 
     /* EXPR_IDENT */
     char *name;            /* owned */
@@ -83,16 +97,13 @@ typedef struct Expr {
     Expr *callee;
     Expr **arguments;
     size_t argument_count;
+
+    /* EXPR_BUILTIN. A NULL callee marks Terminal.Write / Terminal.ReadLine,
+     * which the parser recognises as keywords rather than identifiers. */
+    TokenType builtin;
 } Expr;
 
-/* A local variable or a function parameter. Phase 2 supports `int` and `bool`
- * only; the declared type is retained so a Phase 3 type checker has somewhere
- * to read it from rather than re-parsing. */
-typedef enum {
-    TYPE_INT,
-    TYPE_BOOL
-} TypeKind;
-
+/* A local variable or a function parameter. */
 typedef struct {
     char *name;
     TypeKind type;
@@ -103,17 +114,17 @@ struct Stmt {
     NodeType type;
     Position position;
 
-    Expr *expression;       /* STMT_EXPR, STMT_RETURN, IF/WHILE condition */
+    Expr *expression;       /* STMT_EXPR, STMT_RETURN, IF/LOOP condition */
 
-    char *name;             /* STMT_VAR, STMT_FN: owned */
-    TypeKind declared_type; /* STMT_VAR, STMT_FN */
-    Expr *initializer;      /* STMT_VAR: may be NULL */
+    char *name;             /* STMT_VARIABLE, STMT_FUNCTION: owned */
+    TypeKind declared_type; /* STMT_VARIABLE, STMT_FUNCTION */
+    Expr *initializer;      /* STMT_VARIABLE: may be NULL */
 
     /* Statement arrays.
      *
-     * `body`/`body_count` serve STMT_BLOCK and STMT_FN alike: a node is one or
-     * the other, never both, so they cannot collide. The IF and WHILE forms
-     * use their own fields for clarity at the call site. */
+     * `body`/`body_count` serve STMT_BLOCK and STMT_FUNCTION alike: a node is
+     * one or the other, never both, so they cannot collide. The IF and LOOP
+     * forms use their own fields for clarity at the call site. */
     Stmt **body;
     size_t body_count;
 
@@ -124,14 +135,25 @@ struct Stmt {
     size_t then_count;
     Stmt *else_branch;      /* may be NULL; holds a STMT_BLOCK or STMT_IF */
 
-    /* STMT_WHILE */
+    /* STMT_LOOP */
     Stmt **loop_body_statements;
     size_t loop_count;
 
-    /* STMT_FN: the body occupies `body`/`body_count`. */
+    /* STMT_FUNCTION: the body occupies `body`/`body_count`.
+     * `declares_return` distinguishes `Function f() { }` from
+     * `Function f() -> Number { }`. A function without a declared return type
+     * may not Return a value, which is checked at run time rather than being
+     * inferred. */
     Parameter *parameters;  /* owned array */
     size_t parameter_count;
+    bool declares_return;
 };
+
+/* A declared return type. A function without one may not Return a value. */
+typedef struct {
+    bool declared;
+    TypeKind type;
+} ReturnType;
 
 typedef struct {
     Stmt **statements;

@@ -19,11 +19,16 @@ typedef struct {
     size_t capacity;
 } TokenList;
 
+/* Must stay in the same order as TokenType. The names are the full keywords,
+ * so a diagnostic can quote exactly what the programmer wrote. */
 static const char *const kTypeNames[] = {
-    "end of file", "error", "identifier", "integer", "string",
-    "fn", "var", "return", "if", "else", "while", "true", "false", "bool", "int",
-    "print",
-    "'('", "')'", "'{'", "'}'", "','", "';'", "':'",
+    "end of file", "error", "identifier", "number", "character", "string",
+    "Number", "Character",
+    "Variable", "Function",
+    "If", "Else", "Loop", "Return",
+    "True", "False",
+    "Terminal", "Write", "ReadLine",
+    "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
     "'<'", "'<='", "'>'", "'>='"
 };
@@ -115,12 +120,13 @@ static Token *list_push(TokenList *list) {
 
 static TokenType keyword_type(const char *text, size_t length) {
     static const struct { const char *word; TokenType type; } table[] = {
-        {"fn", TOKEN_FN},         {"var", TOKEN_VAR},
-        {"return", TOKEN_RETURN}, {"if", TOKEN_IF},
-        {"else", TOKEN_ELSE},     {"while", TOKEN_WHILE},
-        {"true", TOKEN_TRUE},     {"false", TOKEN_FALSE},
-        {"bool", TOKEN_BOOL},     {"int", TOKEN_INT_TYPE},
-        {"print", TOKEN_PRINT},
+        {"Number", TOKEN_NUMBER_TYPE},   {"Character", TOKEN_CHARACTER_TYPE},
+        {"Variable", TOKEN_VARIABLE},    {"Function", TOKEN_FUNCTION},
+        {"If", TOKEN_IF},                {"Else", TOKEN_ELSE},
+        {"Loop", TOKEN_LOOP},            {"Return", TOKEN_RETURN},
+        {"True", TOKEN_TRUE},            {"False", TOKEN_FALSE},
+        {"Terminal", TOKEN_TERMINAL},    {"Write", TOKEN_WRITE},
+        {"ReadLine", TOKEN_READ_LINE},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strlen(table[i].word) == length &&
@@ -159,7 +165,7 @@ static void scan_identifier(Lexer *lexer, TokenList *list) {
     }
 }
 
-static void scan_number(Lexer *lexer, TokenList *list) {
+static void scan_number_literal(Lexer *lexer, TokenList *list) {
     Position start = lexer->position;
     size_t number_start = lexer->offset;
 
@@ -169,7 +175,7 @@ static void scan_number(Lexer *lexer, TokenList *list) {
 
     Token *token = list_push(list);
     if (token == NULL) return;
-    token->type = TOKEN_INT;
+    token->type = TOKEN_NUMBER;
     token->start = start;
     token->start_offset = number_start;
     token->length = lexer->offset - number_start;
@@ -180,6 +186,73 @@ static void scan_number(Lexer *lexer, TokenList *list) {
     if (token->text == NULL) return;
     memcpy(token->text, lexer->source + number_start, token->length);
     token->text[token->length] = '\0';
+}
+
+/* Scans a single-quoted character literal, e.g. 'a' or '\n'.
+ *
+ * Character is a byte (see research/design/type-system.md), so a literal holds
+ * exactly one byte. Multi-character literals are rejected rather than silently
+ * truncated, because truncation in a systems language is the kind of quiet
+ * wrongness that is expensive to find later. */
+static void scan_character(Lexer *lexer, TokenList *list) {
+    Position start = lexer->position;
+
+    advance(lexer); /* opening quote */
+
+    if (is_at_end(lexer) || peek(lexer) == '\n') {
+        error_at(lexer, start, "unterminated character literal");
+        return;
+    }
+
+    if (peek(lexer) == '\'') {
+        error_at(lexer, start, "empty character literal");
+        return;
+    }
+
+    unsigned char value;
+    if (peek(lexer) == '\\') {
+        advance(lexer);
+        if (is_at_end(lexer)) {
+            error_at(lexer, start, "unterminated character literal");
+            return;
+        }
+        char escaped = advance(lexer);
+        switch (escaped) {
+            case 'n':  value = '\n'; break;
+            case 't':  value = '\t'; break;
+            case 'r':  value = '\r'; break;
+            case '0':  value = '\0'; break;
+            case '\\': value = '\\'; break;
+            case '\'': value = '\''; break;
+            default:
+                error_at(lexer, start,
+                         "unknown escape sequence '\\%c' in character literal", escaped);
+                return;
+        }
+    } else {
+        value = (unsigned char)advance(lexer);
+    }
+
+    if (is_at_end(lexer) || peek(lexer) != '\'') {
+        error_at(lexer, start,
+                 "character literal holds more than one byte; Character is a single byte");
+        return;
+    }
+    advance(lexer); /* closing quote */
+
+    Token *token = list_push(list);
+    if (token == NULL) return;
+    token->type = TOKEN_CHARACTER;
+    token->start = start;
+    token->start_offset = lexer->offset;
+    token->length = 1;
+
+    char buffer[2];
+    buffer[0] = (char)value;
+    buffer[1] = '\0';
+    token->text = malloc(2);
+    if (token->text == NULL) return;
+    memcpy(token->text, buffer, 2);
 }
 
 /* Scans a quoted string. Rejects unterminated strings and unescaped newlines,
@@ -290,12 +363,17 @@ static void scan_token(Lexer *lexer, TokenList *list) {
     } else if (is_digit(c)) {
         lexer->offset = start_offset;
         lexer->position = start;
-        scan_number(lexer, list);
+        scan_number_literal(lexer, list);
         return;
     } else if (c == '"') {
         lexer->offset = start_offset;
         lexer->position = start;
         scan_string(lexer, list);
+        return;
+    } else if (c == '\'') {
+        lexer->offset = start_offset;
+        lexer->position = start;
+        scan_character(lexer, list);
         return;
     } else {
         switch (c) {
@@ -306,6 +384,11 @@ static void scan_token(Lexer *lexer, TokenList *list) {
             case ',': type = TOKEN_COMMA; break;
             case ';': type = TOKEN_SEMICOLON; break;
             case ':': type = TOKEN_COLON; break;
+            /* Member access, as in Terminal.Write. Terminal is designed as a
+             * value (research/design/keywords-and-io.md), so this will grow
+             * into general field access rather than staying a builtin-only
+             * operator. */
+            case '.': type = TOKEN_DOT; break;
             case '+': type = TOKEN_PLUS; break;
             case '-': type = TOKEN_MINUS; break;
             case '*': type = TOKEN_STAR; break;

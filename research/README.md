@@ -8,6 +8,8 @@ evidence base that decisions get argued from.
 
 | File | What it covers |
 | --- | --- |
+| [design/type-system.md](design/type-system.md) | The two primitive types, derived types, and the rules that connect them |
+| [design/keywords-and-io.md](design/keywords-and-io.md) | Full-name keywords, and Terminal as a value |
 | [decisions.md](decisions.md) | Decisions made, with reasoning, including corrections and reversals |
 | [prototype/allocator-model.md](prototype/allocator-model.md) | Three allocator models compared against the same program |
 | [prototype/error-handling.md](prototype/error-handling.md) | Error unions vs. Result vs. out-parameters |

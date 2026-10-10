@@ -18,11 +18,15 @@ worth more than a clean-looking list.
 | 5 | Audience: solo maintainer, no stability promise | Settled | 2026-10-10 |
 | 6 | Language scope: defined by a kernel-ready feature set | Settled | 2026-10-10 |
 | 7 | Host language for the bootstrap interpreter: C | Settled | 2026-10-10 |
-| 10 | Source file extension: `.sy` | Settled | 2026-10-10 |
+| 10 | Source file extension: `.sl` | **Supersedes** `.sy` | 2026-10-10 |
 | 11 | Comments: `//` and `/* */` | Settled | 2026-10-10 |
 | 12 | Grammar shape: braces and semicolons, C-shaped | Settled, **revisit before Phase 3** | 2026-10-10 |
 | 14 | Allocator model: lexically scoped binding | Prototype verified | 2026-10-10 |
 | 15 | Error handling: error unions with declared error sets | Prototype written | 2026-10-10 |
+| 16 | Keywords spelled out in full | Implemented | 2026-10-10 |
+| 17 | bool is `Number` restricted to 0/1, C-style truthiness | Implemented | 2026-10-10 |
+| 18 | `Number` and `Character` are the only primitives | Implemented | 2026-10-10 |
+| 19 | `Terminal` is a value, not a module | Prototype only | 2026-10-10 |
 
 ---
 
@@ -178,6 +182,88 @@ nothing. The cost of switching later grows with every line of code written.
 
 **Note.** This is not a claim that braces are better. It is a claim about what
 to do first, and an acknowledgement that the question is open.
+
+## 16. Keywords spelled out in full
+
+**Decision.** `If`, `Else`, `Loop`, `Function`, `Variable`, `Return`, `Number`,
+`Character`, `True`, `False`, `Terminal`, `Write`, `ReadLine`.
+
+**Reasoning.**
+
+- **No collision is possible.** A user identifier can never be `Loop` or `If`,
+  so a program cannot shadow a keyword and behave differently from how it
+  reads. With short keywords this is a real class of bug.
+- **Grep works.** `grep Loop` finds every loop and nothing else. `grep while`
+  also finds comments and documentation.
+- **Chained conditionals** use `Else` followed by `If`, introducing no new
+  keyword.
+
+**Cost, accepted.** Four more keystrokes per loop than `while`, seven more per
+declaration than `var`. This is a real ergonomic cost for a language meant to
+be written at speed.
+
+## 17. bool is `Number` restricted to 0 and 1
+
+**Decision.** No boolean type. `True` is `1`, `False` is `0`. Conditions use C
+truthiness: zero is False, anything else is True. The discipline lives in the
+standard library (`Bool.assert`), not in the compiler.
+
+**Reasoning.** Chosen by the author to match C, where `int` serves as `bool`,
+so the type system can be exactly two primitives.
+
+**Consequences, stated plainly.**
+
+- `If (1)` compiles. So does `If (42)`.
+- `If ("x")` is a type error — a String has no truth value.
+- `Function F(a: Number)` accepts `True`, because `True` *is* a Number.
+- Type confusion between integers and booleans is the programmer's
+  responsibility.
+
+**[This reduces safety.]** The Phase 2 interpreter rejected `If (1)`. That check
+was removed by this decision. Recorded explicitly so it is never mistaken for
+an oversight. A compiler that catches this class of mistake is strictly safer;
+Siyana trades that for a two-primitive type system.
+
+**Mitigation.** `Bool.assert` in the library, opt-in. Nothing forces it to be
+called, which is the tradeoff being made.
+
+## 18. `Number` and `Character` are the only primitives
+
+**Decision.** Two primitive types. Every other type — `String`, slices, `Bool`,
+and anything else — is derived in the standard library.
+
+**Reasoning.** Keeps the type system small enough to learn in an afternoon and
+implement correctly in a year. Library code grows without compiler work.
+
+**`Character` is a byte, not a Unicode scalar.** Files are bytes; a `Character`
+that cannot round-trip through a file is the wrong foundation for a language
+meant to write a filesystem. UTF-8 becomes a validated library layer rather
+than a type-system assumption. The visible cost: `Character` is not a
+user-visible character, and `"é"` is two bytes.
+
+**Consequence.** `Number` and `Character` never mix implicitly. No widening.
+
+**[Unresolved]** `Number` has no width. The language needs to express a
+pointer width, a 32-bit counter, and a network-order field, and cannot with one
+unqualified integer type. This is the weakest part of the design and blocks
+Phase 3 implementation.
+
+## 19. `Terminal` is a value, not a module
+
+**Decision.** Design `Terminal` as a value with methods, not as a namespace of
+global functions.
+
+**Reasoning.** A language meant to write an operating system should treat I/O
+as something addressed rather than called into. As a value it can later be
+passed, stored, and become a real kernel object; as a module it cannot.
+
+**Status.** Implemented as a keyword with `Write` and `ReadLine`, but the
+underlying model is still a special case in the interpreter rather than a true
+value. A module cannot become a value later without breaking every program
+that used it, so this must be settled before `File` or `Device` are added.
+
+**[Unresolved]** Whether `Terminal.ReadLine` returns `String` or
+`[]Character`.
 
 ## 14. Allocator model: lexically scoped binding
 

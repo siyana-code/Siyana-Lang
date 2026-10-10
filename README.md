@@ -3,7 +3,7 @@
 A general-purpose programming language, built for command-line tools, systems
 programming, desktop applications, and operating-system-level work.
 
-**Status: Phase 2 of 8 — interpreter core.** A working interpreter for an
+**Status: Phase 3 in progress.** A working interpreter for an
 initial slice of the language. No compiler backend yet.
 
 ## The goal
@@ -44,62 +44,79 @@ $ ./build/siyana.exe --version
 siyana 0.1.0
 phase: 2 - interpreter core
 
-$ ./build/siyana.exe run examples/hello.sy
+$ ./build/siyana.exe run examples/hello.sl
 Hello, Siyana!
 
-$ ./build/siyana.exe run examples/tour.sy
+$ ./build/siyana.exe run examples/tour.sl
 --- literals ---
 42
 ...
 ```
 
-`examples/tour.sy` demonstrates everything the interpreter currently supports.
+`examples/tour.sl` demonstrates everything the interpreter currently supports.
 
 ## The language so far
 
-Implemented in Phase 2 — the interpreter runs this, and nothing beyond it yet.
+Two primitive types — `Number` and `Character`. Everything else derives in the
+standard library. Keywords are spelled out in full.
 
 ```
 // Line comments, and /* block comments */
 
-// Variables need an explicit type
-var count: int = 3;
-count = count + 1;          // assignment
+// Number and Character are the only primitive types
+Variable count: Number = 3;
+Variable letter: Character = 'A';
+count = count + 1;
 
-// Functions
-fn fib(n: int) {            // no return types yet
-    if (n < 2) {
-        return n;
+// Functions may declare a return type
+Function Factorial(n: Number) -> Number {
+    If (n <= 1) {
+        Return 1;
     }
-    return fib(n - 1) + fib(n - 2);
+    Return n * Factorial(n - 1);
 }
 
 // Control flow
-if (count > 3) { print("big"); } else { print("small"); }
+If (count > 3) {
+    Terminal.Write("big");
+} Else If (count > 1) {
+    Terminal.Write("middle");
+} Else {
+    Terminal.Write("small");
+}
 
-var i: int = 0;
-while (i < 3) {
-    print(i);
+Variable i: Number = 0;
+Loop (i < 3) {
+    Terminal.Write(i);
     i = i + 1;
 }
 ```
 
-Types available: `int` and `bool`. Operators: `+ - * /`, `== != < <= > >=`,
-unary `-` and `!`. One builtin: `print`.
+Operators: `+ - * /`, `== != < <= > >=`, unary `-` and `!`. Builtins:
+`Terminal.Write`, `Terminal.ReadLine`.
 
-Deliberately **not** implemented yet, and coming in Phase 3 or later: return
-types, `string` as a declared type, string concatenation, structs, unions,
-enums, slices, modules, and the explicit allocator model.
+**bool is `Number`.** `True` is `1`, `False` is `0`, and conditions use C
+truthiness — so `If (42)` is True. This is a deliberate reduction in safety,
+chosen to keep the type system down to two primitives; the discipline lives in
+the library via `Bool.assert`. See
+[decision 17](research/decisions.md).
+
+Deliberately **not** implemented yet: structs, unions, slices, modules, string
+concatenation, error unions, and the explicit allocator model.
 
 Errors are reported with a source position and a caret:
 
 ```console
-$ ./build/siyana.exe run broken.sy
-broken.sy:1:10: error: expected  ';', found identifier
+$ ./build/siyana.exe run broken.sl
+broken.sl:1:10: error: expected  ';', found identifier
      |
-1   | if (true) { print(1)
+1   | If (True) { Terminal.Write(1)
      |          ^
 ```
+
+See [research/design/type-system.md](research/design/type-system.md) and
+[research/design/keywords-and-io.md](research/design/keywords-and-io.md) for the
+full design and its reasoning.
 
 ## Layout
 

@@ -96,13 +96,25 @@ Test-Case 'unknown option exits non-zero' {
 }
 
 Test-Case 'a valid program runs and exits zero' {
-    # Phase 2 implements the interpreter, so a valid program runs.
-    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("siyana-cli-{0}.sy" -f [guid]::NewGuid())
-    'print("ok");' | Out-File -Encoding ascii $file
+    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("siyana-cli-{0}.sl" -f [guid]::NewGuid())
+    'Terminal.Write("ok");' | Out-File -Encoding ascii $file
     try {
         $r = Invoke-Si @('run', $file)
         if ($r.Code -ne 0) { throw "exit code $($r.Code): $($r.Out)" }
         if ($r.Out -notmatch 'ok') { throw "no output: $($r.Out)" }
+    } finally {
+        Remove-Item $file -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a .sl file is the expected extension' {
+    # Extension is only a convention so far; the interpreter accepts any file.
+    # This pins the documented convention so a rename does not drift silently.
+    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("siyana-cli-{0}.sl" -f [guid]::NewGuid())
+    'Terminal.Write("ok");' | Out-File -Encoding ascii $file
+    try {
+        $r = Invoke-Si @('run', $file)
+        if ($r.Code -ne 0) { throw "exit code $($r.Code): $($r.Out)" }
     } finally {
         Remove-Item $file -ErrorAction SilentlyContinue
     }

@@ -133,7 +133,7 @@ static Expr *expr_new(Parser *parser, NodeType type, Position position) {
 
 static void expr_free(Expr *expr) {
     if (expr == NULL) return;
-    free(expr->string);
+    free(expr->text);
     free(expr->name);
     expr_free(expr->left);
     expr_free(expr->right);
@@ -180,16 +180,16 @@ void program_free(Program *program) {
 /* --- Types ---------------------------------------------------------------- */
 
 static bool parse_type(Parser *parser, TypeKind *out_type) {
-    if (match(parser, TOKEN_INT_TYPE)) {
-        *out_type = TYPE_INT;
+    if (match(parser, TOKEN_NUMBER_TYPE)) {
+        *out_type = TYPE_NUMBER;
         return true;
     }
-    if (match(parser, TOKEN_BOOL)) {
-        *out_type = TYPE_BOOL;
+    if (match(parser, TOKEN_CHARACTER_TYPE)) {
+        *out_type = TYPE_CHARACTER;
         return true;
     }
     fail(parser, current(parser)->start,
-         "expected type 'int' or 'bool', found %s",
+         "expected type 'Number' or 'Character', found %s",
          token_type_description(current(parser)->type));
     return false;
 }
@@ -199,29 +199,43 @@ static bool parse_type(Parser *parser, TypeKind *out_type) {
 static Expr *parse_primary(Parser *parser) {
     const Token *token = current(parser);
 
-    /* `print` is a builtin keyword rather than an identifier, so it is
-     * recognised here and lowered to a call node with a NULL callee. The
-     * interpreter dispatches on that shape. */
-    if (match(parser, TOKEN_PRINT)) {
-        Expr *call = expr_new(parser, EXPR_CALL, token->start);
+    /* Builtins are recognised here and lowered to a call node carrying a
+     * builtin token type rather than a callee. Terminal is designed as a value
+     * (research/design/keywords-and-io.md) so that it can later be passed and
+     * stored; at this phase it has exactly two methods. */
+    if (match(parser, TOKEN_TERMINAL)) {
+        if (!consume(parser, TOKEN_DOT, "'.' after 'Terminal'")) return NULL;
+        if (!check(parser, TOKEN_WRITE) && !check(parser, TOKEN_READ_LINE)) {
+            fail(parser, current(parser)->start,
+                 "expected 'Write' or 'ReadLine' after 'Terminal.', found %s",
+                 token_type_description(current(parser)->type));
+            return NULL;
+        }
+        TokenType builtin = current(parser)->type;
+        advance_token(parser); /* Write or ReadLine */
+
+        Expr *call = expr_new(parser, EXPR_BUILTIN, token->start);
         if (call == NULL) return NULL;
+        call->builtin = builtin;
 
-        if (!consume(parser, TOKEN_LPAREN, "'(' after 'print'")) {
+        if (!consume(parser, TOKEN_LPAREN, "'(' after Terminal method")) {
             expr_free(call);
             return NULL;
         }
 
-        call->arguments = malloc(sizeof(Expr *));
-        if (call->arguments == NULL) {
-            fail(parser, token->start, "out of memory");
-            expr_free(call);
-            return NULL;
-        }
-        call->argument_count = 1;
-        call->arguments[0] = parse_expression(parser);
-        if (parser->failed) {
-            expr_free(call);
-            return NULL;
+        if (!check(parser, TOKEN_RPAREN)) {
+            call->arguments = malloc(sizeof(Expr *));
+            if (call->arguments == NULL) {
+                fail(parser, token->start, "out of memory");
+                expr_free(call);
+                return NULL;
+            }
+            call->argument_count = 1;
+            call->arguments[0] = parse_expression(parser);
+            if (parser->failed) {
+                expr_free(call);
+                return NULL;
+            }
         }
 
         if (!consume(parser, TOKEN_RPAREN, "closing ')'")) {
@@ -231,14 +245,25 @@ static Expr *parse_primary(Parser *parser) {
         return call;
     }
 
-    if (match(parser, TOKEN_INT)) {
-        Expr *expr = expr_new(parser, EXPR_INT, token->start);
+    if (match(parser, TOKEN_NUMBER)) {
+        Expr *expr = expr_new(parser, EXPR_NUMBER, token->start);
         if (expr == NULL) return NULL;
         /* Digits arrive as owned text, so no access to the source buffer. */
-        expr->integer = strtoll(token->text, NULL, 10);
+        expr->number = strtoll(token->text, NULL, 10);
         return expr;
     }
 
+    if (match(parser, TOKEN_CHARACTER)) {
+        Expr *expr = expr_new(parser, EXPR_CHARACTER, token->start);
+        if (expr == NULL) return NULL;
+        expr->text = copy_text(token->text, 1);
+        expr->text_length = 1;
+        return expr;
+    }
+
+    /* True and False are Number literals 1 and 0 (decision 17), not a distinct
+     * boolean type. The node is still marked EXPR_BOOL so the interpreter can
+     * print them in their source form rather than as digits. */
     if (match(parser, TOKEN_TRUE) || match(parser, TOKEN_FALSE)) {
         Expr *expr = expr_new(parser, EXPR_BOOL, token->start);
         if (expr == NULL) return NULL;
@@ -249,7 +274,8 @@ static Expr *parse_primary(Parser *parser) {
     if (match(parser, TOKEN_STRING)) {
         Expr *expr = expr_new(parser, EXPR_STRING, token->start);
         if (expr == NULL) return NULL;
-        expr->string = copy_text(token->text, token->length);
+        expr->text = copy_text(token->text, token->length);
+        expr->text_length = token->length;
         return expr;
     }
 
@@ -500,7 +526,7 @@ static bool parse_block(Parser *parser, Stmt ***out_body, size_t *out_count) {
     return true;
 }
 
-static Stmt *parse_var_declaration(Parser *parser) {
+static Stmt *parse_variable_declaration(Parser *parser) {
     Position start = current(parser)->start;
     advance_token(parser); /* 'var' */
 
@@ -511,7 +537,7 @@ static Stmt *parse_var_declaration(Parser *parser) {
     }
     const Token *name = advance_token(parser);
 
-    Stmt *stmt = stmt_new(parser, STMT_VAR, start);
+    Stmt *stmt = stmt_new(parser, STMT_VARIABLE, start);
     if (stmt == NULL) return NULL;
     stmt->name = copy_ident(name);
 
@@ -547,7 +573,7 @@ static Stmt *parse_function_declaration(Parser *parser) {
     }
     const Token *name = advance_token(parser);
 
-    Stmt *stmt = stmt_new(parser, STMT_FN, start);
+    Stmt *stmt = stmt_new(parser, STMT_FUNCTION, start);
     if (stmt == NULL) return NULL;
     stmt->name = copy_ident(name);
 
@@ -601,6 +627,21 @@ static Stmt *parse_function_declaration(Parser *parser) {
         return NULL;
     }
 
+    /* Optional return type: `-> Number`. Omitting it means the function
+     * returns nothing, which is the common case for early phases and makes an
+     * accidental `Return value` in a void function a clear error later. */
+    if (match(parser, TOKEN_MINUS)) {
+        if (!consume(parser, TOKEN_GT, "'>' to complete '->'")) {
+            stmt_free(stmt);
+            return NULL;
+        }
+        if (!parse_type(parser, &stmt->declared_type)) {
+            stmt_free(stmt);
+            return NULL;
+        }
+        stmt->declares_return = true;
+    }
+
     if (!parse_block(parser, &stmt->body, &stmt->body_count)) {
         stmt_free(stmt);
         return NULL;
@@ -650,11 +691,11 @@ static Stmt *parse_if(Parser *parser) {
     return stmt;
 }
 
-static Stmt *parse_while(Parser *parser) {
+static Stmt *parse_loop(Parser *parser) {
     Position start = current(parser)->start;
     advance_token(parser); /* 'while' */
 
-    Stmt *stmt = stmt_new(parser, STMT_WHILE, start);
+    Stmt *stmt = stmt_new(parser, STMT_LOOP, start);
     if (stmt == NULL) return NULL;
 
     stmt->expression = parse_expression(parser);
@@ -674,10 +715,10 @@ static Stmt *parse_statement(Parser *parser) {
     /* Dispatch on the upcoming token. Each branch owns its own leading token,
      * so nothing is pre-consumed here. */
     switch (current(parser)->type) {
-        case TOKEN_VAR:   return parse_var_declaration(parser);
-        case TOKEN_FN:    return parse_function_declaration(parser);
+        case TOKEN_VARIABLE:   return parse_variable_declaration(parser);
+        case TOKEN_FUNCTION:    return parse_function_declaration(parser);
         case TOKEN_IF:    return parse_if(parser);
-        case TOKEN_WHILE: return parse_while(parser);
+    case TOKEN_LOOP:   return parse_loop(parser);
         case TOKEN_RETURN: {
             Position start = current(parser)->start;
             advance_token(parser);
