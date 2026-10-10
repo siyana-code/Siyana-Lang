@@ -17,6 +17,7 @@ worth more than a clean-looking list.
 | 4 | Target: bootable OS with own toolchain | Settled | 2026-10-10 |
 | 5 | Audience: solo maintainer, no stability promise | Settled | 2026-10-10 |
 | 6 | Language scope: defined by a kernel-ready feature set | Settled | 2026-10-10 |
+| 7 | Host language for the bootstrap interpreter: C | Settled | 2026-10-10 |
 
 ---
 
@@ -101,7 +102,38 @@ definition of done is the only reliable defence.
 generators are all explicitly deferred. Each deferral has a real cost, noted
 in the architecture plan.
 
-## 7. "No assembly" is not achievable; the honest version is
+## 8. Host language for the bootstrap: C
+
+**Decision.** The Phase 2–5 interpreter is written in C. `bootstrap/` reserved
+for it.
+
+**Reasoning.**
+
+- **Portability.** C is the one language available on every machine that could
+  plausibly run the build. Verified locally: GCC 13.2 and Clang 16 targeting
+  `x86_64-w64-mingw32`, C11 builds clean.
+- **Honestly matches the project.** A systems language whose bootstrap is C
+  makes no pretense that C was a good choice for application code — it was
+  chosen because it exists everywhere.
+- **Vocabulary fit.** Pointer arithmetic, manual memory, explicit lifetimes map
+  directly onto the language's own model, so the interpreter's code reads
+  similarly to the Siyana Lang it will eventually implement.
+- **Matches the ecosystem precedent.** Zig's bootstrap compiler is C, kept in
+  sync with the self-hosted one. So is the LLVM-adjacent tradition generally.
+
+**Costs, accepted.**
+
+- Portability bugs in the interpreter surface as bugs in Siyana Lang itself.
+  Mitigated by preferring standard C11 over platform extensions, and by
+  keeping platform code isolated rather than scattered.
+- The interpreter is written roughly twice: once in C, once in Siyana Lang.
+  Mitigated by treating the port as a scheduled milestone, not an afterthought.
+
+**Note.** This is the language used to *build* Siyana Lang. It is not a
+recommendation about Siyana Lang itself, and it is not a constraint on the
+design — only on the bootstrap path.
+
+## 9. "No assembly" is not achievable; the honest version is
 
 **Decision.** The goal is stated as: a complete OS, no external toolchain, at
 most a few bytes of hand-emitted entry glue.
@@ -125,9 +157,16 @@ project.
 
 Not yet made:
 
-1. Host language for the bootstrap interpreter. C is the default candidate.
-2. Error handling: error unions versus an explicit result type.
-3. Compile-time evaluation: design and how much to expose.
+1. Error handling: error unions versus an explicit result type. **Blocks
+   Phase 3.**
+2. Compile-time evaluation: design and how much to expose. **Blocks Phase 3.**
+3. The allocator passing model: threaded, ambient, or lexically scoped.
+   **Blocks Phase 3 — highest risk item in the plan.**
 4. Closures versus first-class function pointers.
 5. Module system: file-based, package-based, or both.
 6. Source file extension.
+
+**[Note]** Phase 1 — scaffolding — is not blocked by any of these. It can be
+built now. Phase 2, the interpreter core, needs only a narrow slice of the
+language (integers, `bool`, arithmetic, comparison, `if`, `while`, functions,
+variables), none of which depends on the open decisions above.
