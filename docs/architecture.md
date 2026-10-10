@@ -347,27 +347,32 @@ Not yet decided, and each blocks a specific phase:
 
 | Question | Blocks | Why it blocks |
 | --- | --- | --- |
-| Allocator passing model | Phase 3 | The highest-risk item. Allocator plumbing shapes every function signature in the language. |
-| Error handling: error unions vs. explicit result type | Phase 3 | Determines how every fallible function is written and called. |
 | Compile-time evaluation design | Phase 3 | Interacts with generics and const sizing; retrofitting is expensive. |
+| Do error payloads exist? | Phase 3 | Changes the type system; decision 15 leaves it open deliberately. |
+| Automatic vs. explicit arena deinit | Phase 3 | Genuine tension between safety and predictability; decision 14 leaves it open. |
 | Closures vs. first-class function pointers | Phase 3 | Closures are in the deferred list but this decides whether deferral is even possible. |
 | Module system | Phase 4 | Needed before the freestanding split. |
 
-**[Settled]** Source file extension (`.sy`), comment syntax, and grammar shape
-were settled before Phase 2 — see decisions 10 to 12.
+**[Settled]** Source extension (`.sy`), comment syntax, grammar shape
+(decisions 10–12), allocator model (14), and error handling (15).
 
 ## What to do next
 
-Phases 1 and 2 are complete. Phase 3 — the semantic core — is next and is
-blocked on the first two rows of the table above.
+Phases 1 and 2 are complete. Phase 3 — the semantic core — is next.
 
-The recommendation stands: settle the allocator and error-handling questions
-*during* Phase 3 by writing the two or three prototype programs that would
-settle them, and keeping whichever design survives contact with real code. Those
-questions are cheap to answer with a prototype and expensive to answer in the
-abstract.
+The two decisions that blocked it are now made, both via prototypes rather
+than argument:
 
-Also outstanding, and cheap to do while the language is still small: revisit
-decision 12 (braces and semicolons). It was explicitly deferred as a decision
-that should be revisited before Phase 3, because the cost of switching later
-grows with every line of code written.
+- **Allocator: lexically scoped binding** (decision 14). Verified by an
+  executable prototype covering nested blocks, early return, and double pop;
+  the harness was confirmed to fail against a deliberately broken restore.
+- **Error handling: error unions with declared error sets** (decision 15).
+
+Next: settle compile-time evaluation, then build the semantic core in this
+order — error propagation first, then the allocator block form. That ordering
+is forced, not preference: an error must be able to unwind past an allocator
+block, so errors have to exist before the block form does.
+
+**Still outstanding:** decision 12 (braces and semicolons) was explicitly
+deferred as a "before Phase 3" item. The cost of switching grows with every
+line written, and the parser is now the largest file in the bootstrap.

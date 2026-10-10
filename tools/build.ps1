@@ -85,6 +85,19 @@ if ($Config -ne 'test') {
 # build so a regression cannot land without a failing test.
 
 if ($Config -eq 'test' -or $Config -ne 'clean') {
+    # The allocator prototype is built and run as part of the suite. It backs
+    # the lexically scoped model recommendation in
+    # research/prototype/allocator-model.md, so it is checked continuously
+    # rather than treated as a one-off experiment.
+    $proto = Join-Path $Root 'prototype/allocator_proto.c'
+    $protoExe = Join-Path $BuildDir 'allocator_proto.exe'
+    if (-not (Test-Path $proto)) { throw "Missing prototype: $proto" }
+    & $CC @CFlags $proto '-o' $protoExe
+    if ($LASTEXITCODE -ne 0) { throw "allocator prototype failed to build" }
+    & $protoExe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host ''
+
     $suites = @(
         (Join-Path $Root 'tests/cli_contract.ps1'),
         (Join-Path $Root 'tests/language.ps1')
