@@ -9,6 +9,8 @@ evidence base that decisions get argued from.
 | File | What it covers |
 | --- | --- |
 | [decisions.md](decisions.md) | Decisions made, with reasoning, including corrections and reversals |
+| [prototype/allocator-model.md](prototype/allocator-model.md) | Three allocator models compared against the same program |
+| [prototype/error-handling.md](prototype/error-handling.md) | Error unions vs. Result vs. out-parameters |
 | [tooling/git-and-github.md](tooling/git-and-github.md) | Branching model, commit format, branch protection, CI, release |
 | [language/landscape.md](language/landscape.md) | Survey of existing systems languages and what each proves or disproves |
 | [language/bootstrap.md](language/bootstrap.md) | How a self-hosting compiler is actually built |

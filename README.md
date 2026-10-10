@@ -110,6 +110,7 @@ broken.sy:1:10: error: expected  ';', found identifier
 | `src/` | Siyana Lang sources (Phase 6) |
 | `lib/` | Siyana Lang standard library (Phase 3) |
 | `tests/` | Test suite — CLI contract and language tests |
+| `prototype/` | Executable prototypes backing design decisions |
 | `tools/` | Build scripts |
 | `docs/` | Architecture plan and design documents |
 | `research/` | Background material, sources, and decision log |

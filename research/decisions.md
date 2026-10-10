@@ -20,7 +20,9 @@ worth more than a clean-looking list.
 | 7 | Host language for the bootstrap interpreter: C | Settled | 2026-10-10 |
 | 10 | Source file extension: `.sy` | Settled | 2026-10-10 |
 | 11 | Comments: `//` and `/* */` | Settled | 2026-10-10 |
-| 12 | Grammar shape: braces and semicolons, C-shaped | Settled | 2026-10-10 |
+| 12 | Grammar shape: braces and semicolons, C-shaped | Settled, **revisit before Phase 3** | 2026-10-10 |
+| 14 | Allocator model: lexically scoped binding | Prototype verified | 2026-10-10 |
+| 15 | Error handling: error unions with declared error sets | Prototype written | 2026-10-10 |
 
 ---
 
@@ -177,6 +179,71 @@ nothing. The cost of switching later grows with every line of code written.
 **Note.** This is not a claim that braces are better. It is a claim about what
 to do first, and an acknowledgement that the question is open.
 
+## 14. Allocator model: lexically scoped binding
+
+**Decision.** Allocators are threaded like Zig (allocation is visible where it
+happens), *plus* an `allocator(x) { ... }` block form that binds an allocator
+for a block and restores the previous one on every exit path.
+
+**Reasoning.** Three models were compared against the same program in
+[prototype/allocator-model.md](prototype/allocator-model.md):
+
+- **Threaded (Zig)** — honest but threads an allocator through functions that
+  allocate nothing, which is the majority of them in a real call chain.
+- **Ambient (Odin)** — clean, but hides which allocator a function uses. In a
+  kernel that is the dangerous case: allocating from a temporary arena in a
+  function believed to be long-lived. It also contradicts the language's own
+  no-hidden-state principle.
+- **Lexically scoped** — the only option that keeps both properties:
+  allocation is visible where it happens, and functions that do not allocate do
+  not carry an allocator parameter.
+
+**Verified, not assumed.** [prototype/allocator_proto.c](../prototype/allocator_proto.c)
+implements the binding and checks it, including the cases where the model
+breaks: nested blocks, early return, and double pop. Nine checks, all passing.
+The harness was confirmed to *fail* against a deliberately broken restore, so
+the passing result means something. Built and run on every build.
+
+**Costs accepted.**
+
+- A new block form, and the compiler must restore the binding on every exit
+  path. This is where bugs will live.
+- No borrowed battle-testing: no existing language does this, so it needs more
+  testing than a conventional design.
+
+**Open.** Does `Arena` get automatic deinit on scope exit, or always explicit
+`defer`? Automatic is safer and matches the block form; explicit is more
+predictable. A genuine tension, to be decided explicitly rather than defaulted.
+
+## 15. Error handling: error unions with declared error sets
+
+**Decision.** Zig-style error unions, with the error set declared per function
+(`error{OpenFailed, PermissionDenied}`). Callers may only handle errors in
+scope; ignoring one is an error. A single `error{Any}` escape hatch exists for
+FFI boundaries and genuinely open sets.
+
+**Reasoning.** Compared in
+[prototype/error-handling.md](prototype/error-handling.md) against Result types
+and C-style out-parameters. This takes Result's static checking with error
+unions' call-site ergonomics, and costs nothing at the type level — an error
+set is just a set of tags.
+
+Error unions suit the OS target specifically: a kernel's errors must be
+*recoverable*, and an error-as-value can be inspected, logged, and returned
+from. Exceptions and abort-on-error both force a policy decision at every
+site.
+
+**Interaction with decision 14.** An error propagating out of an
+`allocator(x) { }` block must restore the binding. The two designs cannot be
+settled independently, and the allocator block must therefore be implemented
+*after* error propagation exists — one unwinding mechanism, not two.
+
+**Open.** Do errors carry payloads? `error.ReadFailed` carrying errno is far
+more useful than the bare tag, and this changes the type system. Should be
+decided explicitly. Also open: whether `try` is a statement only (simple
+grammar, visible failure paths) or also allowed inline (compact, hides
+propagation).
+
 ## 13. Phase 2 language slice
 
 **Decision.** Phase 2 implements only: integer literals, `bool`, arithmetic,
@@ -216,14 +283,15 @@ project.
 
 Not yet made:
 
-1. Error handling: error unions versus an explicit result type. **Blocks
-   Phase 3.**
-2. Compile-time evaluation: design and how much to expose. **Blocks Phase 3.**
-3. The allocator passing model: threaded, ambient, or lexically scoped.
-   **Blocks Phase 3 — highest risk item in the plan.**
-4. Closures versus first-class function pointers.
-5. Module system: file-based, package-based, or both.
-6. Source file extension.
+1. Compile-time evaluation: design and how much to expose. **Blocks Phase 3.**
+2. Closures versus first-class function pointers.
+3. Module system: file-based, package-based, or both. **Blocks Phase 4.**
+4. Do error payloads exist? See decision 15.
+5. Automatic versus explicit arena deinit. See decision 14.
+
+**[Note]** The two decisions that blocked Phase 3 are now made (14 and 15).
+Compile-time evaluation remains, and is the next item to settle before the
+semantic core can be built.
 
 **[Note]** Phase 1 — scaffolding — is not blocked by any of these. It can be
 built now. Phase 2, the interpreter core, needs only a narrow slice of the
