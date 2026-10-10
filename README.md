@@ -3,8 +3,8 @@
 A general-purpose programming language, built for command-line tools, systems
 programming, desktop applications, and operating-system-level work.
 
-**Status: Phase 1 of 8 — scaffolding.** The architecture is designed and the
-build works; the compiler does not yet interpret any Siyana Lang code.
+**Status: Phase 2 of 8 — interpreter core.** A working interpreter for an
+initial slice of the language. No compiler backend yet.
 
 ## The goal
 
@@ -42,16 +42,63 @@ On POSIX systems, use `./tools/build.sh` with the same arguments.
 ```console
 $ ./build/siyana.exe --version
 siyana 0.1.0
-phase: 1 - scaffolding
+phase: 2 - interpreter core
+
+$ ./build/siyana.exe run examples/hello.sy
+Hello, Siyana!
+
+$ ./build/siyana.exe run examples/tour.sy
+--- literals ---
+42
+...
 ```
 
-No language features are implemented yet. Running a source file reports that
-plainly rather than pretending otherwise:
+`examples/tour.sy` demonstrates everything the interpreter currently supports.
+
+## The language so far
+
+Implemented in Phase 2 — the interpreter runs this, and nothing beyond it yet.
+
+```
+// Line comments, and /* block comments */
+
+// Variables need an explicit type
+var count: int = 3;
+count = count + 1;          // assignment
+
+// Functions
+fn fib(n: int) {            // no return types yet
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Control flow
+if (count > 3) { print("big"); } else { print("small"); }
+
+var i: int = 0;
+while (i < 3) {
+    print(i);
+    i = i + 1;
+}
+```
+
+Types available: `int` and `bool`. Operators: `+ - * /`, `== != < <= > >=`,
+unary `-` and `!`. One builtin: `print`.
+
+Deliberately **not** implemented yet, and coming in Phase 3 or later: return
+types, `string` as a declared type, string concatenation, structs, unions,
+enums, slices, modules, and the explicit allocator model.
+
+Errors are reported with a source position and a caret:
 
 ```console
-$ ./build/siyana.exe hello.sy
-siyana: cannot compile 'hello.sy' yet
-siyana: the interpreter is not implemented (Phase 1 of 8)
+$ ./build/siyana.exe run broken.sy
+broken.sy:1:10: error: expected  ';', found identifier
+     |
+1   | if (true) { print(1)
+     |          ^
 ```
 
 ## Layout
@@ -59,25 +106,26 @@ siyana: the interpreter is not implemented (Phase 1 of 8)
 | Path | Contents |
 | --- | --- |
 | `bootstrap/` | C sources for the interpreter (Phases 1–5) |
+| `examples/` | Siyana Lang programs that run today |
 | `src/` | Siyana Lang sources (Phase 6) |
 | `lib/` | Siyana Lang standard library (Phase 3) |
-| `tests/` | Test suite |
+| `tests/` | Test suite — CLI contract and language tests |
 | `tools/` | Build scripts |
 | `docs/` | Architecture plan and design documents |
 | `research/` | Background material, sources, and decision log |
 
 ## Phases
 
-| Phase | Deliverable | Effort |
-| --- | --- | --- |
-| 1 | Scaffolding, build, CLI | S |
-| 2 | Interpreter core — lexer, parser, evaluator | M |
-| 3 | Semantic core — types, unions, errors, allocators | L |
-| 4 | Freestanding subset | M |
-| 5 | CLI-capable standard library | M |
-| 6 | Self-hosted frontend | L |
-| 7 | Own backend — codegen, assembler, linker | L |
-| 8 | Bootable kernel | L |
+| Phase | Deliverable | Effort | Status |
+| --- | --- | --- | --- |
+| 1 | Scaffolding, build, CLI | S | Done |
+| 2 | Interpreter core — lexer, parser, evaluator | M | Done |
+| 3 | Semantic core — types, unions, errors, allocators | L | Next |
+| 4 | Freestanding subset | M | |
+| 5 | CLI-capable standard library | M | |
+| 6 | Self-hosted frontend | L | |
+| 7 | Own backend — codegen, assembler, linker | L | |
+| 8 | Bootable kernel | L | |
 
 Effort bands rather than calendar time: S is a few weeks of evenings, M a few
 months, L a year or more. Calendar estimates for a solo project on this kind of

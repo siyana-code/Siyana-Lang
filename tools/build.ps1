@@ -39,14 +39,17 @@ function Resolve-Compiler {
 }
 
 switch ($Config) {
-    'debug'   { $CFlags = @('-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Wpedantic') }
-    'release' { $CFlags = @('-std=c11', '-O2', '-DNDEBUG', '-Wall', '-Wextra', '-Wpedantic') }
+    # -Werror is on by default. This is a small C codebase where a warning is
+    # almost always a real defect, and treating it as an error keeps the
+    # bootstrap clean without needing a separate CI run to catch it.
+    'debug'   { $CFlags = @('-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Wpedantic', '-Werror') }
+    'release' { $CFlags = @('-std=c11', '-O2', '-DNDEBUG', '-Wall', '-Wextra', '-Wpedantic', '-Werror') }
     'clean' {
         if (Test-Path $BuildDir) { Remove-Item -Recurse -Force $BuildDir }
         Write-Host 'cleaned'
         exit 0
     }
-    'test' { $CFlags = @('-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Wpedantic') }
+    'test'    { $CFlags = @('-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Wpedantic', '-Werror') }
 }
 
 if ($Config -ne 'test') {
@@ -55,7 +58,12 @@ if ($Config -ne 'test') {
 
     $Sources = @(
         (Join-Path $Root 'bootstrap/main.c'),
-        (Join-Path $Root 'bootstrap/version.c')
+        (Join-Path $Root 'bootstrap/version.c'),
+        (Join-Path $Root 'bootstrap/lexer.c'),
+        (Join-Path $Root 'bootstrap/parser.c'),
+        (Join-Path $Root 'bootstrap/interp.c'),
+        (Join-Path $Root 'bootstrap/diagnostics.c'),
+        (Join-Path $Root 'bootstrap/driver.c')
     )
 
     foreach ($s in $Sources) {
@@ -73,12 +81,18 @@ if ($Config -ne 'test') {
 }
 
 # ---- Tests -----------------------------------------------------------------
-# Phase 1 has no language tests yet; the suite covers the CLI contract.
-# Language tests arrive in Phase 2 and are added alongside it.
+# The suite covers the CLI contract and the language slice. Both run on every
+# build so a regression cannot land without a failing test.
 
 if ($Config -eq 'test' -or $Config -ne 'clean') {
-    $testScript = Join-Path $Root 'tests/cli_contract.ps1'
-    if (-not (Test-Path $testScript)) { throw "Missing test script: $testScript" }
-    & $testScript
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $suites = @(
+        (Join-Path $Root 'tests/cli_contract.ps1'),
+        (Join-Path $Root 'tests/language.ps1')
+    )
+
+    foreach ($suite in $suites) {
+        if (-not (Test-Path $suite)) { throw "Missing test suite: $suite" }
+        & $suite
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
 }
