@@ -52,8 +52,13 @@ switch ($Config) {
     'test'    { $CFlags = @('-std=c11', '-O0', '-g', '-Wall', '-Wextra', '-Wpedantic', '-Werror') }
 }
 
+# Resolved unconditionally, not inside the build block below: the allocator
+# prototype is compiled on every run, including `-Config test`, so leaving this
+# to the build block left $CC unset for that path and the run died on a
+# strict-mode error rather than doing anything useful.
+$CC = Resolve-Compiler
+
 if ($Config -ne 'test') {
-    $CC = Resolve-Compiler
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
     $Sources = @(

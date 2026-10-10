@@ -24,25 +24,45 @@ typedef struct {
 typedef enum {
     VALUE_NIL,
     VALUE_INTEGER,
-    VALUE_STRING
+    VALUE_STRING,
+    VALUE_STRUCT,
+    VALUE_UNION
 } ValueType;
 
+/* A struct or union value.
+ *
+ * Both hold a reference to their declaration rather than copying the field
+ * list, so a type can be registered after a value referencing it exists
+ * without invalidating anything. Fields are a parallel array over the
+ * declaration's fields; for a union only the slot at `tag` is meaningful. */
+typedef struct Decl Decl;
+typedef struct Value Value;
+
 typedef struct {
+    const Decl *decl;
+    Value *fields;              /* owned */
+    long long tag;              /* active variant for a union; -1 if none */
+} Aggregate;
+
+struct Value {
     ValueType type;
     union {
         Integer integer;
         /* Borrowed from the AST node, except for Terminal.ReadLine which
          * returns an owned buffer documented at the call site. */
         struct { const char *chars; size_t length; } string;
+        Aggregate aggregate;
     } as;
     /* Set when the value came from the True or False literal, so output can
      * show the source form. Presentation only -- truthiness follows the
      * integer, since bool is Number (decision 17).
      *
      * A separate flag rather than testing the value, because False is 0 and
-     * would otherwise be indistinguishable from an ordinary Number 0. */
+     * would otherwise be indistinguishable from an ordinary Number 0.
+     */
     bool is_bool_literal;
-} Value;
+};
+
 
 typedef struct {
     bool had_error;

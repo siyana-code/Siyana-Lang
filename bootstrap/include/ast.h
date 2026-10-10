@@ -22,6 +22,9 @@ typedef enum {
     STMT_LOOP,
     STMT_RETURN,
     STMT_FUNCTION,
+    STMT_STRUCT,
+    STMT_UNION,
+    STMT_MATCH,
 
     /* Expressions */
     EXPR_NUMBER,
@@ -33,8 +36,19 @@ typedef enum {
     EXPR_BINARY,
     EXPR_ASSIGN,
     EXPR_CALL,
-    EXPR_BUILTIN
+    EXPR_BUILTIN,
+    EXPR_STRUCT_INIT,
+    EXPR_FIELD,
+    EXPR_UNION_INIT
 } NodeType;
+
+/* What a type declaration defines. An Error is a union whose variants carry no
+ * payload, which is why it gets its own kind rather than being a union with
+ * empty payloads everywhere. */
+typedef enum {
+    DECL_STRUCT,
+    DECL_UNION
+} DeclKind;
 
 typedef enum {
     OP_NEGATE,
@@ -66,13 +80,19 @@ typedef enum {
     TYPE_NUMBER,     /* 64-bit signed. The default. */
     TYPE_NUMBER32,   /* 32-bit signed. Error codes and 32-bit ABI values. */
     TYPE_WORD,       /* Pointer-width unsigned. Sizes, indexes, addresses. */
-    TYPE_CHARACTER   /* 8-bit unsigned. Bytes. */
+    TYPE_CHARACTER,  /* 8-bit unsigned. Bytes. */
+
+    /* A Struct or Union name. Resolved at run time rather than parse time,
+     * because a declaration may legally appear after its use. The name is
+     * carried alongside the declaration. */
+    TYPE_NAMED
 } TypeKind;
 
 const char *type_kind_name(TypeKind type);
 
 /* Size in bytes. `Word` reports the pointer width of the build target, which
- * is the one width that is not fixed. */
+ * is the one width that is not fixed. Named types report 0; their size comes
+ * from the declaration once resolved. */
 size_t type_kind_size(TypeKind type);
 
 /* True when the type can represent only non-negative values. */
@@ -116,23 +136,53 @@ typedef struct Expr {
     /* EXPR_BUILTIN. A NULL callee marks Terminal.Write / Terminal.ReadLine,
      * which the parser recognises as keywords rather than identifiers. */
     TokenType builtin;
+
+    /* EXPR_STRUCT_INIT and EXPR_UNION_INIT: `name` is the aggregate type.
+     * Struct fields travel in `arguments` as one EXPR_ASSIGN each, so the
+     * field name travels with its value and order does not matter at the call
+     * site. For a union, `variant` names the variant and `payload` holds its
+     * value, or NULL for a payload-less variant. */
+    char *variant;         /* owned */
+    Expr *payload;
 } Expr;
 
 /* A local variable or a function parameter. */
 typedef struct {
     char *name;
     TypeKind type;
+    char *type_name;       /* owned; set when type is TYPE_NAMED */
     Position position;
 } Parameter;
+
+/* A named field of a struct, or a variant of a union. */
+typedef struct {
+    char *name;
+    TypeKind type;         /* ignored for a payload-less union variant */
+    Position position;
+    bool has_payload;      /* union variants only */
+} Field;
+
+/* One arm of a Match: a variant name, the name to bind its payload to (NULL
+ * if the arm does not use it), and the statements to run. */
+typedef struct {
+    char *variant;         /* owned */
+    char *binding;         /* owned, may be NULL */
+    Position position;
+    Stmt **body;
+    size_t body_count;
+} MatchArm;
 
 struct Stmt {
     NodeType type;
     Position position;
 
-    Expr *expression;       /* STMT_EXPR, STMT_RETURN, IF/LOOP condition */
+    Expr *expression;       /* STMT_EXPR, STMT_RETURN, IF/LOOP, MATCH subject */
 
-    char *name;             /* STMT_VARIABLE, STMT_FUNCTION: owned */
+    char *name;             /* STMT_VARIABLE, STMT_FUNCTION, STMT_STRUCT,
+                             * STMT_UNION: owned */
     TypeKind declared_type; /* STMT_VARIABLE, STMT_FUNCTION */
+    /* When `declared_type` is TYPE_NAMED, this holds the type's name. Owned. */
+    char *type_name;
     Expr *initializer;      /* STMT_VARIABLE: may be NULL */
 
     /* Statement arrays.
@@ -162,6 +212,15 @@ struct Stmt {
     Parameter *parameters;  /* owned array */
     size_t parameter_count;
     bool declares_return;
+
+    /* STMT_STRUCT and STMT_UNION */
+    DeclKind decl_kind;
+    Field *fields;         /* owned array */
+    size_t field_count;
+
+    /* STMT_MATCH */
+    MatchArm *arms;        /* owned array */
+    size_t arm_count;
 };
 
 /* A declared return type. A function without one may not Return a value. */

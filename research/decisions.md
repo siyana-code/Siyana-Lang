@@ -401,6 +401,67 @@ most a few bytes of hand-emitted entry glue.
 or linker." It is wrong, and better to know now than at the end of the
 project.
 
+## 21. Structs are values, not handles
+
+**Decision.** A `Struct` is a value type. Declaring, assigning, or passing one
+copies it. There is no `&` or `*` in the language yet, so every struct is a
+value and there is no reference form to special-case.
+
+```
+Struct Point { x: Number32, y: Number32, }
+Variable a: Point = Point { x: 1, y: 2 };
+Variable b: Point = a;
+b.x = 99;              // a.x is still 1
+```
+
+**Reasoning.** Zig and C both take this route; Rust makes it the default and
+then immediately complicates it with lifetimes. The alternative - reference
+semantics - was rejected for three reasons:
+
+- An OS spends its life passing structures around: a `PageTable`, a
+  `RegisterFrame`, a `Task`. Copy semantics make that safe by default.
+- With reference semantics, "who owns this?" needs an answer everywhere, and
+  every answer is either a manual free or a borrow checker. This language has
+  neither yet.
+- Reference semantics are *additive* later - a `&T` can be introduced once
+  lifetimes exist. Value semantics are *subtractive*: converting a
+  reference-semantics program to values means revisiting every alias.
+
+The cost is real and is recorded here rather than discovered later: copying a
+large struct is expensive. An OS will want pointers eventually, and that is
+what decision 22's `Word` is for.
+
+**How this was verified.** The interpreter initially shared one `fields` array
+between a variable and its copy, so `b.x = 99` silently changed `a` too. That
+is the exact bug value semantics exists to prevent, and it is now a named test
+(`a struct copies on assignment`).
+
+## 22. `Match` is a statement and is exhaustiveness-checked at run time
+
+**Decision.** `Match` destructures a union. Every variant must be handled, or
+the program fails when the `Match` is reached. It is a statement, not an
+expression.
+
+**Reasoning.** Two properties, one syntax.
+
+*Exhaustiveness* is the whole value of a tagged union. A union that can be
+silently unhandled is worse than an integer tag, because the type *looks* safe
+while it is not. Checking it when the `Match` executes rather than at parse
+time means a value built dynamically cannot escape the check either - the
+interpreter has no static types to prove against yet, and pretending otherwise
+would give a guarantee it cannot keep.
+
+*Statement-only* keeps the grammar flat and keeps failure paths visible. A
+`Match` used as an expression would need a "what does an unhandled variant
+evaluate to" answer, which is exactly the question exhaustiveness exists to
+remove. Revisit if a case turns up where expression form is genuinely needed.
+
+**A union has no guaranteed byte layout.** Recorded here because it is a
+consequence, not a preference: tag placement is an implementation detail and
+programs must not depend on it. Anything written to a file or a wire protocol
+goes through a `Struct`, whose layout *is* specified. See
+[design/tagged-unions-and-errors.md](design/tagged-unions-and-errors.md).
+
 ## Open decisions
 
 Not yet made:
@@ -410,6 +471,10 @@ Not yet made:
 3. Module system: file-based, package-based, or both. **Blocks Phase 4.**
 4. Do error payloads exist? See decision 15.
 5. Automatic versus explicit arena deinit. See decision 14.
+6. Pointers and borrows. Decision 21 makes structs values; a `Word` serves as
+   an integer but nothing yet means "a reference to a struct." Blocked on 1 and
+   on the allocator model, since a pointer without an owner invites the leaks
+   decision 14 exists to prevent.
 
 **[Note]** The two decisions that blocked Phase 3 are now made (14 and 15).
 Compile-time evaluation remains, and is the next item to settle before the

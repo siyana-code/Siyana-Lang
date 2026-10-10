@@ -125,8 +125,18 @@ truthiness — so `If (42)` is True. A deliberate reduction in safety, chosen to
 keep the type system small; the discipline lives in the library via
 `Bool.assert`. See [decision 17](research/decisions.md).
 
-Deliberately **not** implemented yet: structs, unions, slices, modules, string
-concatenation, error unions, and the explicit allocator model.
+**Structs are values.** `Variable b: P = a` copies. There is no aliasing to
+reason about and no pointer syntax yet. See [decision 21](research/decisions.md).
+
+**`Match` is exhaustiveness-checked.** A `Match` on a union with an unhandled
+variant fails when it is reached. A tagged union that can be silently ignored is
+worse than an integer tag, because the type looks safe while it is not. A tagged
+union also has *no guaranteed byte layout* — on-disk and wire formats go
+through a `Struct`, whose layout is specified. See
+[decision 22](research/decisions.md).
+
+Deliberately **not** implemented yet: slices, modules, pointers, string
+concatenation, error propagation, and the explicit allocator model.
 
 Errors are reported with a source position and a caret:
 

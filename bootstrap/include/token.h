@@ -14,7 +14,7 @@
 
 typedef enum {
     TOKEN_EOF,
-    TOKEN_ERROR,
+    TOKEN_LEX_ERROR,   // lexer failure marker; not a keyword
 
     /* Literals */
     TOKEN_IDENT,
@@ -47,6 +47,14 @@ typedef enum {
     TOKEN_TERMINAL,
     TOKEN_WRITE,
     TOKEN_READ_LINE,
+
+    /* Aggregate declarations */
+    TOKEN_STRUCT,
+    TOKEN_UNION,
+    TOKEN_ERROR,      /* `Error Name { ... }` -- a payload-less union */
+
+    /* Match */
+    TOKEN_MATCH,
 
     /* Punctuation */
     TOKEN_LPAREN,

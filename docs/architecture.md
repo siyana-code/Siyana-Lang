@@ -162,7 +162,7 @@ accompany this phase has not been run. It should be enabled when a toolchain
 with a sanitizer runtime is available, or on a POSIX host where ASan ships with
 the compiler.
 
-### Phase 3 — Semantic core (L)
+### Phase 3 — Semantic core (L) — IN PROGRESS
 
 The real language. Types, tagged unions, error handling, and — critically —
 the explicit allocator model.
@@ -172,10 +172,31 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
 
 **Exit criteria**
 
-- A tagged union with a payload compiles and runs.
+- A tagged union with a payload compiles and runs. — **met**
 - An error propagates from a deep call stack with its context intact.
 - An allocation failure is surfaced as a value, never a crash.
-- A test suite exists that is expressive enough to write the OS in.
+- A test suite exists that is expressive enough to write the OS in. — **partly**
+
+**Done so far**
+
+- Fixed-width integers: `Number`, `Number32`, `Word`, `Character` (decision 20).
+- `Struct` declarations, literals, field read and assignment, value semantics
+  (decision 21).
+- `Union` declarations with payload-less and payload-carrying variants, and
+  `Match` with exhaustiveness checking (decision 22).
+- `Error Name { ... }` declared as a payload-less union. `Try`/`Catch` are not
+  yet implemented.
+- Named types usable in `Variable x: Foo` and parameter positions, resolved at
+  run time so a declaration may follow its use.
+
+**Remaining, in the order the design forces**
+
+1. Compile-time evaluation — still undecided, and it is the last Phase 3
+   blocker that is a *choice* rather than a build.
+2. Error propagation, `Try`/`Catch`, and `Result{T, E}`.
+3. The allocator block form. Ordered after 2 deliberately: an error
+   propagating out of an `allocator(x) { }` block must restore the binding, so
+   building the block first would mean building unwinding twice.
 
 ### Phase 4 — Freestanding subset (M)
 
@@ -358,20 +379,26 @@ Not yet decided, and each blocks a specific phase:
 
 ## What to do next
 
-Phases 1 and 2 are complete. Phase 3 — the semantic core — is next.
+Phases 1 and 2 are complete. Phase 3 — the semantic core — is under way: the
+integer types, structs, tagged unions, and `Match` all build and are tested.
 
-The two decisions that blocked it are now made, both via prototypes rather
-than argument:
+The two decisions that blocked Phase 3 were made via prototypes rather than
+argument:
 
 - **Allocator: lexically scoped binding** (decision 14). Verified by an
   executable prototype covering nested blocks, early return, and double pop;
   the harness was confirmed to fail against a deliberately broken restore.
 - **Error handling: error unions with declared error sets** (decision 15).
 
-Next: settle compile-time evaluation, then build the semantic core in this
-order — error propagation first, then the allocator block form. That ordering
-is forced, not preference: an error must be able to unwind past an allocator
-block, so errors have to exist before the block form does.
+Three decisions have been added since: structs are values (21), and `Match` is
+an exhaustiveness-checked statement whose unions have no guaranteed byte
+layout (22).
+
+Next: settle compile-time evaluation — the last Phase 3 item that is a *choice*
+rather than a build. After that the remaining order is forced: error
+propagation first, then the allocator block form. An error must be able to
+unwind past an allocator block, so errors have to exist before the block form
+does.
 
 **Still outstanding:** decision 12 (braces and semicolons) was explicitly
 deferred as a "before Phase 3" item. The cost of switching grows with every
