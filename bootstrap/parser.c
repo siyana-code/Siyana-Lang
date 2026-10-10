@@ -184,12 +184,20 @@ static bool parse_type(Parser *parser, TypeKind *out_type) {
         *out_type = TYPE_NUMBER;
         return true;
     }
+    if (match(parser, TOKEN_NUMBER32_TYPE)) {
+        *out_type = TYPE_NUMBER32;
+        return true;
+    }
+    if (match(parser, TOKEN_WORD_TYPE)) {
+        *out_type = TYPE_WORD;
+        return true;
+    }
     if (match(parser, TOKEN_CHARACTER_TYPE)) {
         *out_type = TYPE_CHARACTER;
         return true;
     }
     fail(parser, current(parser)->start,
-         "expected type 'Number' or 'Character', found %s",
+         "expected type 'Number', 'Number32', 'Word', or 'Character', found %s",
          token_type_description(current(parser)->type));
     return false;
 }

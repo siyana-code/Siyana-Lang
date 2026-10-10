@@ -57,15 +57,23 @@ $ ./build/siyana.exe run examples/tour.sl
 
 ## The language so far
 
-Two primitive types — `Number` and `Character`. Everything else derives in the
-standard library. Keywords are spelled out in full.
+Four integer types — fixed-width, because an OS needs to express a network
+header, an ioctl value, and a buffer size in one program. Keywords are spelled
+out in full.
+
+| Type | Width | Signed | For |
+| --- | --- | --- | --- |
+| `Character` | 8 | no | Bytes: memory, files, text |
+| `Number32` | 32 | yes | Error codes, 32-bit ABI values |
+| `Number` | 64 | yes | The default. Ordinary arithmetic |
+| `Word` | pointer | no | Sizes, indexes, offsets, addresses |
 
 ```
 // Line comments, and /* block comments */
 
-// Number and Character are the only primitive types
 Variable count: Number = 3;
 Variable letter: Character = 'A';
+Variable size: Word = 4096;
 count = count + 1;
 
 // Functions may declare a return type
@@ -95,11 +103,27 @@ Loop (i < 3) {
 Operators: `+ - * /`, `== != < <= > >=`, unary `-` and `!`. Builtins:
 `Terminal.Write`, `Terminal.ReadLine`.
 
+**Overflow is an error, never a wrap.**
+
+```console
+Variable n: Number32 = 2147483647;
+Variable m: Number32 = n + 1;
+```
+
+```
+error: overflow in Number32 arithmetic
+```
+
+This is the property that matters most for an OS. In C that expression silently
+produces `-2147483648`, and a buffer size that wraps to `0` is a heap overflow.
+
+**Mixed widths do not mix.** `Number32 + Number` is a type error naming both
+sides, rather than a promotion rule that quietly changes the result's width.
+
 **bool is `Number`.** `True` is `1`, `False` is `0`, and conditions use C
-truthiness — so `If (42)` is True. This is a deliberate reduction in safety,
-chosen to keep the type system down to two primitives; the discipline lives in
-the library via `Bool.assert`. See
-[decision 17](research/decisions.md).
+truthiness — so `If (42)` is True. A deliberate reduction in safety, chosen to
+keep the type system small; the discipline lives in the library via
+`Bool.assert`. See [decision 17](research/decisions.md).
 
 Deliberately **not** implemented yet: structs, unions, slices, modules, string
 concatenation, error unions, and the explicit allocator model.
@@ -114,9 +138,10 @@ broken.sl:1:10: error: expected  ';', found identifier
      |          ^
 ```
 
-See [research/design/type-system.md](research/design/type-system.md) and
-[research/design/keywords-and-io.md](research/design/keywords-and-io.md) for the
-full design and its reasoning.
+See [research/design/integer-types.md](research/design/integer-types.md),
+[type-system.md](research/design/type-system.md), and
+[keywords-and-io.md](research/design/keywords-and-io.md) for the full design and
+its reasoning.
 
 ## Layout
 

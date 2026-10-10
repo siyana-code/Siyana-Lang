@@ -27,6 +27,7 @@ worth more than a clean-looking list.
 | 17 | bool is `Number` restricted to 0/1, C-style truthiness | Implemented | 2026-10-10 |
 | 18 | `Number` and `Character` are the only primitives | Implemented | 2026-10-10 |
 | 19 | `Terminal` is a value, not a module | Prototype only | 2026-10-10 |
+| 20 | Fixed-width integers: `Number`, `Number32`, `Word`, `Character` | Implemented | 2026-10-10 |
 
 ---
 
@@ -241,12 +242,47 @@ meant to write a filesystem. UTF-8 becomes a validated library layer rather
 than a type-system assumption. The visible cost: `Character` is not a
 user-visible character, and `"é"` is two bytes.
 
-**Consequence.** `Number` and `Character` never mix implicitly. No widening.
+**Consequence.** Integer types never mix implicitly. No widening.
 
-**[Unresolved]** `Number` has no width. The language needs to express a
-pointer width, a 32-bit counter, and a network-order field, and cannot with one
-unqualified integer type. This is the weakest part of the design and blocks
-Phase 3 implementation.
+## 20. Fixed-width integer types
+
+**Decision.** `Number` (64-bit signed, the default), `Number32` (32-bit
+signed), `Word` (pointer-width unsigned), `Character` (8-bit unsigned).
+Arithmetic that overflows its type is an error, never a wrap.
+
+**This reverses part of decision 18.** Decision 18 had a single unqualified
+`Number`; that cannot express a pointer width, a 32-bit ioctl field, and a
+buffer size in the same program.
+
+**Reasoning.** From research on real systems languages:
+
+- **Hardware has no single word width.** Tratt: "we need separate notions of
+  address, data, and object widths."
+- **Linux** uses `u8`/`u16`/`u32`/`u64`, signed equivalents, and `uintptr_t`.
+- **Rust** uses `i8`..`i64` plus `isize`/`usize`.
+- **The kernel style guide** says the goal is "clear integer types, where the
+  abstraction helps avoid confusion whether it's `int` or `long`."
+
+See [integer-types.md](design/integer-types.md) for the full research.
+
+**Why four types and not ten.** The smallest set that can express an OS. Missing
+widths (`Number8`, `Number16`, `Number128`, unsigned 32/64) are **additive** —
+adding them later breaks nothing.
+
+**Two guarantees that matter most for an OS:**
+
+1. **Mixed-width arithmetic is an error.** `Number32 + Number` is rejected.
+   Silently mixing widths is the origin of a large class of integer bugs.
+2. **Overflow is an error, never a wrap.** A size that wraps from `0xFFFFFFFF`
+   to `0` is a heap overflow; a wrapped file offset is a wrong-place write.
+   This is Zig's behaviour and the single strongest safety property here.
+
+**Cost, accepted.** Four integer types instead of one is more to learn, and
+`Number32` is an ungainly name. Both are cheaper than a memory-corruption bug.
+
+**[Unresolved]** Whether lossless widening should be implicit (`Number32` to
+`Number`). Rust and C# allow it; Zig does not. Recommendation: allow, since it
+is genuinely lossless on every target.
 
 ## 19. `Terminal` is a value, not a module
 

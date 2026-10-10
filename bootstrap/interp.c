@@ -135,36 +135,110 @@ static void fail(InterpState *state, Position position, const char *fmt, ...) {
     va_end(args);
 }
 
+/* --- Integer types --------------------------------------------------------- */
+
 const char *type_kind_name(TypeKind type) {
     switch (type) {
         case TYPE_NUMBER:    return "Number";
+        case TYPE_NUMBER32:  return "Number32";
+        case TYPE_WORD:      return "Word";
         case TYPE_CHARACTER: return "Character";
         default:             return "unknown";
     }
 }
 
+/* Pointer width of the build target. Word is the one type whose size is not
+ * fixed, and that is exactly why it exists. */
+size_t type_kind_size(TypeKind type) {
+    switch (type) {
+        case TYPE_NUMBER:    return 8;
+        case TYPE_NUMBER32:  return 4;
+        case TYPE_CHARACTER: return 1;
+        case TYPE_WORD:      return sizeof(void *);
+        default:             return 0;
+    }
+}
+
+bool type_kind_is_unsigned(TypeKind type) {
+    return type == TYPE_WORD || type == TYPE_CHARACTER;
+}
+
+/* Representable range for each type. Computed rather than written out so the
+ * two's-complement assumption is stated once. */
+typedef struct {
+    long long min;
+    unsigned long long max;
+} Range;
+
+static Range range_of(TypeKind type) {
+    Range range;
+    switch (type) {
+        case TYPE_NUMBER:
+            /* int64 in two's complement. LONG_MIN is avoided so the literal
+             * does not depend on the host's long width. */
+            range.min = -9223372036854775807LL - 1;
+            range.max = 9223372036854775807ULL;
+            break;
+        case TYPE_NUMBER32:
+            range.min = -2147483647LL - 1;
+            range.max = 2147483647ULL;
+            break;
+        case TYPE_WORD:
+            /* Word is unsigned and pointer-width. */
+            range.min = 0;
+            range.max = (sizeof(void *) >= 8) ? 18446744073709551615ULL
+                                              : 4294967295ULL;
+            break;
+        case TYPE_CHARACTER:
+            range.min = 0;
+            range.max = 255;
+            break;
+        default:
+            range.min = 0;
+            range.max = 0;
+            break;
+    }
+    return range;
+}
+
+/* True when `value` fits `type`. Used both to validate literals and to check
+ * arithmetic results. */
+static bool integer_fits(long long value, TypeKind type) {
+    Range range = range_of(type);
+    if (value < 0) {
+        /* A negative value only fits a signed type, and only down to its min. */
+        if (type_kind_is_unsigned(type)) return false;
+        return value >= range.min;
+    }
+    return (unsigned long long)value <= range.max;
+}
+
+/* True when a value's runtime type matches its declared type. Integer values
+ * carry their own Siyana type, so this is a comparison rather than a category
+ * check -- which is what makes `Variable x: Number32 = 5` legal while
+ * `Variable x: Number32 = "a"` is not. */
+static bool value_matches_type(Value value, TypeKind declared) {
+    if (value.type != VALUE_INTEGER) return false;
+    return value.as.integer.type == declared;
+}
+
 static const char *type_name_of(Value value) {
+    if (value.type == VALUE_INTEGER) return type_kind_name(value.as.integer.type);
     switch (value.type) {
-        case VALUE_NIL:       return "nothing";
-        case VALUE_NUMBER:    return "Number";
-        case VALUE_CHARACTER: return "Character";
-        case VALUE_STRING:    return "String";
-        default:              return "unknown";
+        case VALUE_NIL:    return "nothing";
+        case VALUE_STRING: return "String";
+        default:           return "unknown";
     }
 }
 
 /* C-style truthiness, following decision 17: zero is False, anything else is
- * True. Character 0 is False as well.
+ * True.
  *
  * This is the deliberate reduction in safety that decision 17 records. The
  * Phase 2 interpreter rejected `If (1)`; this accepts it, which is what C
- * does and what makes the type system as small as two primitives. */
+ * does and what keeps the type system to four integer types. */
 static bool is_truthy(Value value) {
-    switch (value.type) {
-        case VALUE_NUMBER:    return value.as.number != 0;
-        case VALUE_CHARACTER: return value.as.character != 0;
-        default:              return false;
-    }
+    return value.type == VALUE_INTEGER && value.as.integer.bits != 0;
 }
 
 /* --- Control flow ---------------------------------------------------------- */
@@ -192,18 +266,19 @@ static bool evaluate(InterpState *state, const Expr *expression,
 
 /* --- Values ---------------------------------------------------------------- */
 
-static Value value_number(long long number) {
+/* Builds an integer value of the given Siyana type. Callers are responsible
+ * for having already checked that `bits` fits `type`; arithmetic below does
+ * that check before calling. */
+static Value value_integer(long long bits, TypeKind type) {
     Value value = {0};
-    value.type = VALUE_NUMBER;
-    value.as.number = number;
+    value.type = VALUE_INTEGER;
+    value.as.integer.bits = bits;
+    value.as.integer.type = type;
     return value;
 }
 
-static Value value_character(unsigned char character) {
-    Value value = {0};
-    value.type = VALUE_CHARACTER;
-    value.as.character = character;
-    return value;
+static Value value_number(long long bits) {
+    return value_integer(bits, TYPE_NUMBER);
 }
 
 static Value value_string(const char *chars, size_t length) {
@@ -264,24 +339,149 @@ static Value value_as_plain(Value value) {
     return value;
 }
 
-/* Numeric and character values are both ordered, so the six comparison
- * operators share one implementation. Number and Character are distinct types
- * and never mix (see the type system doc), so the caller has already checked
- * that both sides are the same kind. */
-static bool compare_ordered(Value left, Value right, int *out_comparison) {
-    if (left.type == VALUE_NUMBER) {
-        long long a = left.as.number;
-        long long b = right.as.number;
-        *out_comparison = (a > b) - (a < b);
+/* Arithmetic on fixed-width integers.
+ *
+ * Two rules make this safe, and both are from
+ * research/design/integer-types.md:
+ *
+ *   1. Both operands must be the same type. Mixing widths silently is the
+ *      origin of a large class of integer bugs.
+ *   2. The result must fit that type. Overflow is an error, never a wrap --
+ *      a size that wraps from 0xFFFFFFFF to 0 is a heap overflow.
+ */
+
+/* Computes `a op b` and reports whether it fits `type`.
+ *
+ * The operation is performed on unsigned values so that the overflow check is
+ * not defeated by signed overflow in the host language, which is undefined
+ * behaviour in C.
+ *
+ * For unsigned types a plain comparison of the result against the width mask
+ * is not enough: `Word(0) - 1` wraps to exactly 0xFFFFFFFFFFFFFFFF, which
+ * equals the mask and would pass. Subtraction therefore also carries a borrow,
+ * which is the real signal that the result is negative.
+ */
+static bool checked_arithmetic(Operator op, long long a, long long b,
+                               TypeKind type, long long *out_result,
+                               const char **out_reason) {
+    unsigned long long ua = (unsigned long long)a;
+    unsigned long long ub = (unsigned long long)b;
+    unsigned long long ur = 0;
+    bool division_by_zero = false;
+    bool borrow = false;
+
+    switch (op) {
+        case OP_ADD:      ur = ua + ub; break;
+        case OP_SUBTRACT:
+            ur = ua - ub;
+            borrow = (ub > ua);   /* the true signal of an underflow */
+            break;
+        case OP_MULTIPLY: ur = ua * ub; break;
+        case OP_DIVIDE:
+            if (b == 0) {
+                division_by_zero = true;
+                break;
+            }
+            ur = ua / ub;
+            break;
+        default:
+            *out_reason = "unhandled operator";
+            return false;
+    }
+
+    if (division_by_zero) {
+        *out_reason = "division by zero";
+        return false;
+    }
+
+    /* An unsigned type can never produce a negative result, so a borrow is an
+     * error regardless of how the wrapped bits happen to look. */
+    if (borrow && type_kind_is_unsigned(type)) {
+        *out_reason = "overflow";
+        return false;
+    }
+
+    /* Reinterpret in the target type's width and check the result fits. A
+     * result that needed bits above the width will not fit and is reported. */
+    unsigned long long mask;
+    switch (type) {
+        case TYPE_CHARACTER: mask = 0xFFULL; break;
+        case TYPE_NUMBER32:   mask = 0xFFFFFFFFULL; break;
+        case TYPE_WORD:       mask = (sizeof(void *) >= 8) ? ~0ULL : 0xFFFFFFFFULL; break;
+        case TYPE_NUMBER:     mask = ~0ULL; break;
+        default:              mask = 0; break;
+    }
+
+    unsigned long long narrowed = ur & mask;
+    long long signed_result = (long long)narrowed;
+
+    /* For signed types, the wrapped bit pattern must have the sign bit clear
+     * or set consistently -- otherwise it came from an overflow. */
+    if (type == TYPE_NUMBER32 || type == TYPE_NUMBER) {
+        unsigned long long limit = (type == TYPE_NUMBER32) ? 0x7FFFFFFFULL : 0x7FFFFFFFFFFFFFFFULL;
+        if (ur > limit) {
+            *out_reason = "overflow";
+            return false;
+        }
+        /* A negative result arises when the unsigned computation underflowed;
+         * that is valid for subtraction but must not be produced by, say, an
+         * unsigned type at all. */
+        if (narrowed != ur) {
+            *out_reason = "overflow";
+            return false;
+        }
+        *out_result = signed_result;
         return true;
     }
-    if (left.type == VALUE_CHARACTER) {
-        unsigned char a = left.as.character;
-        unsigned char b = right.as.character;
-        *out_comparison = (a > b) - (a < b);
-        return true;
+
+    /* Unsigned types: any value above the mask overflowed. */
+    if (ur > mask) {
+        *out_reason = "overflow";
+        return false;
     }
-    return false;
+    *out_result = (long long)ur;
+    return true;
+}
+
+static int compare_integers(long long a, long long b) {
+    return (a > b) - (a < b);
+}
+
+/* True when `expression` is a bare integer literal that has not yet been given
+ * a type by its context.
+ *
+ * `is_untyped_literal` must agree with adopt_operand_type's precondition. They
+ * are checked together here so the two cannot drift. */
+static bool is_untyped_literal(const Expr *expression, Value value) {
+    return expression != NULL && expression->type == EXPR_NUMBER &&
+           value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER;
+}
+
+/* Gives an untyped integer literal the type of the operand it is paired with.
+ *
+ * Without this, `w - 30` would be a type error because `30` evaluated as a
+ * Number while `w` is a Word -- which would make every arithmetic expression
+ * need a cast, and `Word` effectively unusable.
+ *
+ * Adoption is allowed toward any integer type, provided the value fits. The
+ * signed/unsigned direction is included deliberately: `w - 1` and `c + 1` are
+ * the most ordinary expressions in the language, and refusing them would be
+ * crippling in a way no real systems language does. The protection against
+ * silently turning a negative literal into an unsigned value is *not* lost --
+ * `integer_fits` rejects -1 for Word, so the case that actually matters is
+ * still an error. A positive literal is unambiguously that literal's value
+ * whichever type it becomes. */
+static bool adopt_operand_type(const Expr *expression, Value *value,
+                               Value from_other_side) {
+    if (!is_untyped_literal(expression, *value)) return false;
+    if (from_other_side.type != VALUE_INTEGER) return false;
+
+    TypeKind wanted = from_other_side.as.integer.type;
+    if (wanted == TYPE_NUMBER) return false;
+    if (!integer_fits((*value).as.integer.bits, wanted)) return false;
+
+    (*value).as.integer.type = wanted;
+    return true;
 }
 
 static bool evaluate_binary(InterpState *state, const Expr *expression,
@@ -291,139 +491,172 @@ static bool evaluate_binary(InterpState *state, const Expr *expression,
     if (!evaluate(state, expression->left, scope, &left)) return false;
     if (!evaluate(state, expression->right, scope, &right)) return false;
 
-    /* Equality: strings compare by content, other types require a match.
-     * Mismatched types are an error rather than silently false -- a type error
-     * here almost always means a mistake. */
+    /* Contextual typing, applied before the operator is dispatched.
+     *
+     * Skipped for equality: comparing a Number against a Character literal
+     * should report a type error rather than silently producing False, and
+     * letting `1` adopt Character's type would turn a real mistake into a
+     * plausible-looking answer. */
+    if (expression->op != OP_EQUAL && expression->op != OP_NOT_EQUAL) {
+        adopt_operand_type(expression->left, &left, right);
+        adopt_operand_type(expression->right, &right, left);
+    }
+
+    /* Equality between strings compares content; between integers it needs
+     * matching types. Anything else is a type error rather than silently
+     * false, because a mismatch here is almost always a mistake. */
     if (expression->op == OP_EQUAL || expression->op == OP_NOT_EQUAL) {
         if (left.type == VALUE_STRING || right.type == VALUE_STRING) {
             if (left.type != right.type) {
                 fail(state, expression->position,
                      "cannot compare %s with %s using '%s'",
-                     type_name_of(left), type_name_of(right), operator_symbol(expression->op));
+                     type_name_of(left), type_name_of(right),
+                     operator_symbol(expression->op));
                 return false;
             }
-            bool equal = strings_equal(left, right);
-            *out = value_bool_result(expression->op == OP_EQUAL ? equal : !equal);
+            *out = value_bool_result(strings_equal(left, right) ==
+                                     (expression->op == OP_EQUAL));
             return true;
         }
 
         if (left.type != right.type) {
             fail(state, expression->position,
                  "cannot compare %s with %s using '%s'",
-                 type_name_of(left), type_name_of(right), operator_symbol(expression->op));
+                 type_name_of(left), type_name_of(right),
+                 operator_symbol(expression->op));
             return false;
         }
 
-        bool equal = false;
-        switch (left.type) {
-            case VALUE_NUMBER:    equal = left.as.number == right.as.number; break;
-            case VALUE_CHARACTER: equal = left.as.character == right.as.character; break;
-            case VALUE_NIL:       equal = true; break;
-            default: break;
+        if (left.type == VALUE_NIL) {
+            *out = value_bool_result(expression->op == OP_EQUAL);
+            return true;
         }
-        *out = value_bool_result(expression->op == OP_EQUAL ? equal : !equal);
+
+        /* Same type required. Number32 == Number is an error, not False: the
+         * two mean different things and a mismatch is worth reporting. */
+        if (left.as.integer.type != right.as.integer.type) {
+            fail(state, expression->position,
+                 "cannot compare %s with %s using '%s'",
+                 type_kind_name(left.as.integer.type),
+                 type_kind_name(right.as.integer.type),
+                 operator_symbol(expression->op));
+            return false;
+        }
+
+        bool equal = left.as.integer.bits == right.as.integer.bits;
+        *out = value_bool_result(equal == (expression->op == OP_EQUAL));
         return true;
     }
 
-    /* The remaining operators require matching types. */
-    if (left.type != right.type) {
+    /* Every other operator needs two integers of the same type. */
+    if (left.type != VALUE_INTEGER || right.type != VALUE_INTEGER) {
         fail(state, expression->position,
              "cannot apply '%s' to %s and %s",
              operator_symbol(expression->op), type_name_of(left), type_name_of(right));
         return false;
     }
 
-    int comparison = 0;
-    if (!compare_ordered(left, right, &comparison)) {
+    TypeKind type = left.as.integer.type;
+    if (right.as.integer.type != type) {
         fail(state, expression->position,
-             "operator '%s' requires Number or Character operands, got %s",
-             operator_symbol(expression->op), type_name_of(left));
+             "cannot apply '%s' to %s and %s -- both operands must be the same type",
+             operator_symbol(expression->op), type_kind_name(type),
+             type_kind_name(right.as.integer.type));
         return false;
     }
 
+    long long a = left.as.integer.bits;
+    long long b = right.as.integer.bits;
+
+    /* Unsigned types compare as unsigned, or a negative left operand would
+     * look smaller than any positive right operand. */
+    int comparison;
+    if (type_kind_is_unsigned(type)) {
+        unsigned long long ua = (unsigned long long)a;
+        unsigned long long ub = (unsigned long long)b;
+        comparison = (ua > ub) - (ua < ub);
+    } else {
+        comparison = compare_integers(a, b);
+    }
+
     switch (expression->op) {
-        case OP_LESS:           *out = value_bool_result(comparison <  0); return true;
-        case OP_LESS_EQUAL:     *out = value_bool_result(comparison <= 0); return true;
-        case OP_GREATER:        *out = value_bool_result(comparison >  0); return true;
-        case OP_GREATER_EQUAL:  *out = value_bool_result(comparison >= 0); return true;
+        case OP_LESS:          *out = value_bool_result(comparison <  0); return true;
+        case OP_LESS_EQUAL:    *out = value_bool_result(comparison <= 0); return true;
+        case OP_GREATER:       *out = value_bool_result(comparison >  0); return true;
+        case OP_GREATER_EQUAL: *out = value_bool_result(comparison >= 0); return true;
         default: break;
     }
 
-    /* Arithmetic. Number wraps at 64 bits; Character wraps at 8, matching the
-     * byte definition in the type system doc. */
-    if (left.type == VALUE_CHARACTER) {
-        unsigned char a = left.as.character;
-        unsigned char b = right.as.character;
-        long long result = 0;
-        switch (expression->op) {
-            case OP_ADD:      result = a + b; break;
-            case OP_SUBTRACT: result = a - b; break;
-            case OP_MULTIPLY: result = a * b; break;
-            case OP_DIVIDE:
-                if (b == 0) {
-                    fail(state, expression->position, "division by zero");
-                    return false;
-                }
-                result = a / b;
-                break;
-            default:
-                fail(state, expression->position, "unhandled operator '%s'",
-                     operator_symbol(expression->op));
-                return false;
-        }
-        *out = value_character((unsigned char)(result & 0xFF));
-        return true;
-    }
-
-    long long a = left.as.number;
-    long long b = right.as.number;
     long long result = 0;
-    switch (expression->op) {
-        case OP_ADD:      result = a + b; break;
-        case OP_SUBTRACT: result = a - b; break;
-        case OP_MULTIPLY: result = a * b; break;
-        case OP_DIVIDE:
-            if (b == 0) {
-                fail(state, expression->position, "division by zero");
-                return false;
-            }
-            result = a / b;
-            break;
-        default:
+    const char *reason = NULL;
+    if (!checked_arithmetic(expression->op, a, b, type, &result, &reason)) {
+        if (reason != NULL && strcmp(reason, "unhandled operator") == 0) {
             fail(state, expression->position, "unhandled operator '%s'",
                  operator_symbol(expression->op));
-            return false;
+        } else {
+            fail(state, expression->position, "%s in %s arithmetic", reason,
+                 type_kind_name(type));
+        }
+        return false;
     }
 
-    *out = value_number(result);
+    *out = value_integer(result, type);
     return true;
 }
 
+
+/* Negation is checked against the type's minimum rather than through
+ * checked_arithmetic: that path computes in unsigned space, so `0 - 7` would
+ * look like an underflow rather than the ordinary signed negation `-7`. The
+ * minimum is also the one value with no positive counterpart. */
+static bool checked_negate(long long bits, TypeKind type, long long *out_result) {
+    if (type_kind_is_unsigned(type)) return false;
+    if (bits == range_of(type).min) return false;
+    *out_result = -bits;
+    return true;
+}
 static bool evaluate_unary(InterpState *state, const Expr *expression,
                             Scope *scope, Value *out) {
     Value operand;
     if (!evaluate(state, expression->right, scope, &operand)) return false;
 
     if (expression->op == OP_NOT) {
-        /* C semantics: !0 is 1, anything else is 0. Works for Character too. */
+        /* C semantics: !0 is 1, anything else is 0. */
         *out = value_bool_result(!is_truthy(operand));
         return true;
     }
 
-    if (operand.type == VALUE_CHARACTER) {
-        *out = value_character((unsigned char)(0xFF - operand.as.character));
-        return true;
-    }
-    if (operand.type != VALUE_NUMBER) {
+    if (operand.type != VALUE_INTEGER) {
         fail(state, expression->position,
-             "operator '-' requires a Number or Character operand, got %s",
+             "operator '-' requires an integer operand, got %s",
              type_name_of(operand));
         return false;
     }
-    *out = value_number(-operand.as.number);
+
+    TypeKind type = operand.as.integer.type;
+    long long bits = operand.as.integer.bits;
+
+    /* Negation is checked against the type's minimum rather than through
+     * checked_arithmetic: that path computes in unsigned space, so `0 - 7`
+     * would look like an underflow rather than the ordinary signed negation
+     * `-7`. The minimum is also the one value with no positive counterpart. */
+    long long negated;
+    if (!checked_negate(bits, type, &negated)) {
+        if (type_kind_is_unsigned(type)) {
+            fail(state, expression->position,
+                 "cannot negate %s, which has no negative values",
+                 type_kind_name(type));
+        } else {
+            fail(state, expression->position,
+                 "cannot negate %s: %lld is the smallest value it can hold",
+                 type_kind_name(type), bits);
+        }
+        return false;
+    }
+
+    *out = value_integer(negated, type);
     return true;
 }
-
 /* --- Functions ------------------------------------------------------------- */
 
 static bool register_function(InterpState *state, const Stmt *declaration, Scope *closure) {
@@ -478,17 +711,27 @@ static bool call_function(InterpState *state, const Function *function,
          * common mistake and gives a message that names the parameter. */
         /* The literal form is dropped on the way in: the callee received a Number,
          * not the expression `True`. */
+        /* Same literal-narrowing rule as variable initialisers, and for the
+         * same reason: a Number literal may become a Number32 or Character
+         * when it fits, but nothing is inferred across the signed/unsigned
+         * boundary. */
         Value argument = value_as_plain(arguments[i]);
         TypeKind expected = parameter->type;
-        bool matches = (expected == TYPE_NUMBER && argument.type == VALUE_NUMBER) ||
-                       (expected == TYPE_CHARACTER && argument.type == VALUE_CHARACTER);
-        if (!matches) {
-            fail(state, parameter->position,
-                 "parameter '%s' of '%s' expects %s, got %s",
-                 parameter->name, declaration->name,
-                 type_kind_name(expected), type_name_of(argument));
-            scope_destroy(call_scope);
-            return false;
+        if (!value_matches_type(argument, expected)) {
+            TypeKind given = argument.type == VALUE_INTEGER
+                                 ? argument.as.integer.type
+                                 : TYPE_NUMBER;
+            if (argument.type == VALUE_INTEGER && given == TYPE_NUMBER &&
+                integer_fits(argument.as.integer.bits, expected)) {
+                argument = value_integer(argument.as.integer.bits, expected);
+            } else {
+                fail(state, parameter->position,
+                     "parameter '%s' of '%s' expects %s, got %s",
+                     parameter->name, declaration->name,
+                     type_kind_name(expected), type_name_of(argument));
+                scope_destroy(call_scope);
+                return false;
+            }
         }
         if (!scope_define(call_scope, parameter->name, argument)) {
             fail(state, parameter->position, "out of memory");
@@ -518,19 +761,26 @@ static bool call_function(InterpState *state, const Function *function,
  * than 'A' would make Character painful to debug. */
 static void write_value(Value value) {
     switch (value.type) {
-        case VALUE_NUMBER:
-            /* True and False print in their source form. The distinction only
-             * exists for the literal, so `Variable x: Number = True` prints 1
-             * -- which is honest, since it is a Number holding 1. */
+        case VALUE_INTEGER:
             if (value.is_bool_literal) {
-                printf("%s", value.as.number != 0 ? "True" : "False");
+                /* True and False print in their source form. The distinction
+                 * only exists for the literal, so `Variable x: Number = True`
+                 * prints 1 -- honest, since it is a Number holding 1. */
+                printf("%s", value.as.integer.bits != 0 ? "True" : "False");
+            } else if (value.as.integer.type == TYPE_CHARACTER) {
+                /* A Character prints as the character it denotes. Printing 65
+                 * for 'A' would make Character painful to debug. */
+                putchar((int)value.as.integer.bits);
             } else {
-                printf("%lld", value.as.number);
+                printf("%lld", value.as.integer.bits);
             }
             break;
-        case VALUE_CHARACTER: putchar((int)value.as.character); break;
-        case VALUE_STRING:    fwrite(value.as.string.chars, 1, value.as.string.length, stdout); break;
-        default:              printf("nothing"); break;
+        case VALUE_STRING:
+            fwrite(value.as.string.chars, 1, value.as.string.length, stdout);
+            break;
+        default:
+            printf("nothing");
+            break;
     }
 }
 
@@ -661,11 +911,15 @@ static bool evaluate(InterpState *state, const Expr *expression,
 
     switch (expression->type) {
         case EXPR_NUMBER:
+            /* A literal has no type until something gives it one. It arrives
+             * here as a Number and is narrowed by the operation that consumes
+             * it -- see adopt_operand_type in evaluate_binary -- so that
+             * `w - 30` works when w is a Word. */
             *out = value_number(expression->number);
             return true;
 
         case EXPR_CHARACTER:
-            *out = value_character((unsigned char)expression->text[0]);
+            *out = value_integer((unsigned char)expression->text[0], TYPE_CHARACTER);
             return true;
 
         /* True and False are Number 1 and 0 (decision 17). They stay distinct
@@ -756,17 +1010,33 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             if (statement->initializer != NULL) {
                 if (!evaluate(state, statement->initializer, scope, &initial)) return false;
 
-                /* Number and Character are distinct types and never convert
-                 * implicitly (type system doc). A mismatch names both sides so
-                 * the fix is obvious. */
+                /* An integer literal takes the declared type when it fits.
+                 *
+                 * Narrowing is allowed only from Number to Character and from
+                 * Number to Number32 -- both are literal-width choices, since a
+                 * literal has no type of its own until something gives it one.
+                 * Crossing to Word is refused: silently turning a signed literal
+                 * into an unsigned one is the mistake this whole change exists
+                 * to prevent, so `Variable n: Word = -1` must be written with an
+                 * explicit conversion. */
                 TypeKind expected = statement->declared_type;
-                bool matches = (expected == TYPE_NUMBER && initial.type == VALUE_NUMBER) ||
-                               (expected == TYPE_CHARACTER && initial.type == VALUE_CHARACTER);
-                if (!matches) {
-                    fail(state, statement->position,
-                         "cannot initialise '%s' of type %s with a %s",
-                         statement->name, type_kind_name(expected), type_name_of(initial));
-                    return false;
+                if (!value_matches_type(initial, expected)) {
+                    TypeKind given = initial.type == VALUE_INTEGER
+                                         ? initial.as.integer.type
+                                         : TYPE_NUMBER;
+                    bool literal_narrowing = initial.type == VALUE_INTEGER &&
+                                             given == TYPE_NUMBER &&
+                                             integer_fits(initial.as.integer.bits, expected);
+
+                    if (literal_narrowing) {
+                        initial = value_integer(initial.as.integer.bits, expected);
+                    } else {
+                        fail(state, statement->position,
+                             "cannot initialise '%s' of type %s with %s",
+                             statement->name, type_kind_name(expected),
+                             type_name_of(initial));
+                        return false;
+                    }
                 }
             }
 
@@ -798,12 +1068,12 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
         case STMT_IF: {
             Value condition;
             if (!evaluate(state, statement->expression, scope, &condition)) return false;
-            /* C-style truthiness (decision 17): any Number or Character,
-             * zero being False. A String condition is a type error, since
-             * there is no reasonable reading of `If ("x")`. */
-            if (condition.type != VALUE_NUMBER && condition.type != VALUE_CHARACTER) {
+            /* C-style truthiness (decision 17): any integer, zero being False.
+             * A String condition is a type error, since there is no reasonable
+             * reading of `If ("x")`. */
+            if (condition.type != VALUE_INTEGER) {
                 fail(state, statement->position,
-                     "condition of 'If' must be Number or Character, got %s",
+                     "condition of 'If' must be an integer, got %s",
                      type_name_of(condition));
                 return false;
             }
@@ -821,9 +1091,9 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             while (true) {
                 Value condition;
                 if (!evaluate(state, statement->expression, scope, &condition)) return false;
-                if (condition.type != VALUE_NUMBER && condition.type != VALUE_CHARACTER) {
+                if (condition.type != VALUE_INTEGER) {
                     fail(state, statement->position,
-                         "condition of 'Loop' must be Number or Character, got %s",
+                         "condition of 'Loop' must be an integer, got %s",
                          type_name_of(condition));
                     return false;
                 }

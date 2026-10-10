@@ -24,6 +24,8 @@ typedef enum {
 
     /* Types */
     TOKEN_NUMBER_TYPE,
+    TOKEN_NUMBER32_TYPE,
+    TOKEN_WORD_TYPE,
     TOKEN_CHARACTER_TYPE,
 
     /* Declarations */
