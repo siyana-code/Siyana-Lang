@@ -29,6 +29,7 @@ static const char *const kTypeNames[] = {
     "True", "False",
     "Terminal", "Write", "ReadLine",
     "Struct", "Union", "Error", "Match",
+    "Result", "Try", "Catch", "Fail",
     "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
     "'<'", "'<='", "'>'", "'>='"
@@ -131,6 +132,8 @@ static TokenType keyword_type(const char *text, size_t length) {
         {"ReadLine", TOKEN_READ_LINE},
         {"Struct", TOKEN_STRUCT}, {"Union", TOKEN_UNION},
         {"Error", TOKEN_ERROR}, {"Match", TOKEN_MATCH},
+        {"Result", TOKEN_RESULT}, {"Try", TOKEN_TRY}, {"Catch", TOKEN_CATCH},
+        {"Fail", TOKEN_FAIL},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strlen(table[i].word) == length &&

@@ -31,6 +31,22 @@ typedef struct {
     Stmt *declaration;   /* STMT_FUNCTION */
     Scope *closure;
 } Function;
+/* A failure travelling up the call stack.
+ *
+ * Carried on InterpState rather than on Flow because `Try` sits inside an
+ * expression and evaluate() has no Flow to thread through. The alternative is
+ * changing every evaluate() signature in the interpreter to plumb it, for a
+ * signal that is almost always false.
+ *
+ * `propagating` is set by Try, noticed by the statement loop, and cleared by
+ * the function-call boundary that finally owns it. It is a second exit path
+ * alongside Flow.returned, and the two never both apply at once. */
+typedef struct {
+    bool propagating;
+    Value error;                  /* a VALUE_RESULT carrying the failure */
+    const Stmt *propagating_from; /* the function that set it */
+} Propagation;
+
 
 /* A registered Struct or Union declaration. Kept by pointer rather than copied
  * so a Value can reference it for its whole lifetime. */
@@ -52,6 +68,12 @@ typedef struct {
     Decl *decls;
     size_t decl_count;
     size_t decl_capacity;
+
+    /* The function whose body is running, so `Try` can check the callee's
+     * error set against the caller's. NULL at the top level, where anything
+     * that could fail is an error: there is no caller to report it to. */
+    const Stmt *current_function;
+    Propagation propagation;
 
     bool failed;
     char message[192];
@@ -280,6 +302,7 @@ typedef struct {
     Value return_value;
 } Flow;
 
+
 static Value value_nil(void) {
     Value value = {0};
     value.type = VALUE_NIL;
@@ -322,6 +345,15 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                               Scope *scope, Flow *flow);
 static bool evaluate(InterpState *state, const Expr *expression,
                      Scope *scope, Value *out);
+
+/* Defined with the error helpers below, but needed by call_function, which
+ * wraps every declared Result on the way out. */
+static bool make_result_ok(Value inner, Value *out);
+
+/* Used by the Catch arms; declared here because a Catch can appear inside any
+ * expression, including one evaluated long before this function is defined. */
+static bool execute_block(InterpState *state, Stmt *const *body, size_t count,
+                          Scope *scope, Flow *flow);
 
 /* --- Values ---------------------------------------------------------------- */
 
@@ -818,16 +850,52 @@ static bool call_function(InterpState *state, const Function *function,
         }
     }
 
+    const Stmt *enclosing = state->current_function;
+    state->current_function = declaration;
+    state->propagation.propagating = false;
+    state->propagation.propagating_from = NULL;
+
     Flow flow = {0};
     for (size_t i = 0; i < declaration->body_count; i++) {
         if (!execute_statement(state, declaration->body[i], call_scope, &flow)) {
+            state->current_function = enclosing;
             scope_destroy(call_scope);
             return false;
         }
-        if (flow.returned) break;
+        /* A propagating error is this function's return value, so the body
+         * stops here exactly as it would for a Return. */
+        if (flow.returned || state->propagation.propagating) break;
     }
 
-    *out = flow.returned ? flow.return_value : value_nil();
+    if (declaration->declared_type == TYPE_RESULT) {
+        if (state->propagation.propagating) {
+            /* Hand the failure to whoever called this function. Rule 1 already
+             * guarantees they must have written a Try or a Catch, so there is
+             * nothing to check here -- including when *they* are the top level,
+             * where `F(2) Catch { ... }` is a perfectly good program. */
+            *out = state->propagation.error;
+            state->propagation.propagating = false;
+        } else {
+            if (!make_result_ok(flow.returned ? flow.return_value : value_nil(), out)) {
+                fail(state, declaration->position, "out of memory");
+                state->current_function = enclosing;
+                scope_destroy(call_scope);
+                return false;
+            }
+        }
+    } else if (state->propagation.propagating) {
+        /* Rule 4: a function that declares no error set cannot raise one. */
+        fail(state, declaration->position,
+             "'%s' propagates an error but does not declare an error set",
+             declaration->name);
+        state->current_function = enclosing;
+        scope_destroy(call_scope);
+        return false;
+    } else {
+        *out = flow.returned ? flow.return_value : value_nil();
+    }
+
+    state->current_function = enclosing;
     scope_destroy(call_scope);
     return true;
 }
@@ -887,6 +955,23 @@ static void write_value(Value value) {
         }
         default:
             printf("nothing");
+            break;
+        case VALUE_RESULT:
+            /* Only reachable if a Result is printed directly, which rule 1 is
+             * meant to prevent. Shown rather than hidden so that if the rule is
+             * ever relaxed, the output says what happened. */
+            if (value.as.result.ok) {
+                printf("Ok(");
+                if (value.as.result.value != NULL) write_value(*value.as.result.value);
+                printf(")");
+            } else if (value.as.result.error_decl != NULL &&
+                       value.as.result.error_variant <
+                           value.as.result.error_decl->node->field_count) {
+                printf("Error.%s",
+                       value.as.result.error_decl->node->fields[value.as.result.error_variant].name);
+            } else {
+                printf("Error");
+            }
             break;
     }
 }
@@ -1010,7 +1095,18 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
 
     if (ok) ok = call_function(state, function, arguments, expression->argument_count, out);
     free(arguments);
-    return ok;
+    if (!ok) return false;
+
+    /* Rule 1: a call that can fail must be handled at the point of the call.
+     * The parser marked this node when it is the operand of Try or Catch, which
+     * is the only place that relationship is visible. */
+    if (function->declaration->declared_type == TYPE_RESULT && !expression->handled) {
+        fail(state, expression->position,
+             "'%s' can fail; follow the call with Try or Catch", name);
+        return false;
+    }
+
+    return true;
 }
 
 /* --- Aggregates: structs and unions ---------------------------------------- */
@@ -1339,6 +1435,291 @@ static bool assign_field(InterpState *state, const Expr *expression,
     return true;
 }
 
+/* --- Errors: Try, Catch, and propagation ---------------------------------- */
+
+/* Wraps a value as a successful Result. */
+static bool make_result_ok(Value inner, Value *out) {
+    out->type = VALUE_RESULT;
+    memset(&out->as, 0, sizeof(out->as));
+    out->as.result.ok = true;
+    out->as.result.value = malloc(sizeof(Value));
+    if (out->as.result.value == NULL) return false;
+    *out->as.result.value = inner;
+    return true;
+}
+
+/* Builds a failure Result carrying one variant of `decl`. */
+static bool make_result_error(const Decl *decl, size_t variant, Value *out) {
+    out->type = VALUE_RESULT;
+    memset(&out->as, 0, sizeof(out->as));
+    out->as.result.ok = false;
+    out->as.result.error_decl = decl;
+    out->as.result.error_variant = variant;
+    return true;
+}
+
+/* The error set a function declared, or NULL when it is infallible.
+ *
+ * Resolution happens here rather than at parse time because an Error
+ * declaration may follow the function that uses it, the same rule that lets a
+ * function be called before the line that defines it. */
+static const Decl *function_error_set(const InterpState *state, const Stmt *declaration) {
+    if (declaration == NULL || declaration->declared_type != TYPE_RESULT) return NULL;
+    return find_decl(state, declaration->result_error_name);
+}
+
+/* True when `outer` can carry every error `inner` can produce. A callee's
+ * error set is a subset of the caller's -- the caller must be able to name
+ * whatever the callee might raise. */
+static bool error_set_covers(const Decl *outer, const Decl *inner) {
+    if (inner == NULL) return true;
+    if (outer == NULL) return false;
+    for (size_t i = 0; i < inner->node->field_count; i++) {
+        if (find_field(outer, inner->node->fields[i].name) < 0) return false;
+    }
+    return true;
+}
+
+/* Names the variants of `inner` that `outer` cannot carry. Used to make the
+ * diagnostic say what to add rather than only that something is wrong. */
+static void report_missing_errors(InterpState *state, Position position,
+                                  const char *callee, const Decl *inner,
+                                  const Decl *outer) {
+    char missing[192];
+    size_t used = 0;
+    missing[0] = '\0';
+
+    for (size_t i = 0; i < inner->node->field_count; i++) {
+        const char *name = inner->node->fields[i].name;
+        if (outer != NULL && find_field(outer, name) >= 0) continue;
+        int written = snprintf(missing + used, sizeof(missing) - used, "%s%s",
+                               used > 0 ? ", " : "", name);
+        if (written < 0 || (size_t)written >= sizeof(missing) - used) break;
+        used += (size_t)written;
+    }
+
+    fail(state, position,
+         "'%s' can fail with '%s', which '%s' does not declare",
+         callee, missing,
+         state->current_function != NULL ? state->current_function->name : "this scope");
+}
+
+/* The fallible expression under a Try or Catch, resolved to its declaration.
+ * Both operators require a call, because both need to know the callee's error
+ * set, and a call is the only thing that has one. */
+static bool require_fallible_call(InterpState *state, const Expr *expression,
+                                  const Expr **call, Position position) {
+    const Expr *operand = expression->left;
+    if (operand == NULL || operand->type != EXPR_CALL ||
+        operand->callee == NULL || operand->callee->type != EXPR_IDENT) {
+        fail(state, position, "Try and Catch apply to a function call");
+        return false;
+    }
+    *call = operand;
+    return true;
+}
+
+/* `expr Try` -- on failure, return the error from the enclosing function.
+ *
+ * Exactly Zig's `catch |err| return err`, spelled so there is one form of it.
+ * The rule that matters is the one enforced here: the enclosing function must
+ * declare an error set that covers the callee's, or the error would leave a
+ * function whose signature cannot describe it. */
+static bool evaluate_try(InterpState *state, const Expr *expression, Scope *scope,
+                         Value *out) {
+    const Expr *call = NULL;
+    if (!require_fallible_call(state, expression, &call, expression->position)) return false;
+
+    const char *callee = call->callee->name;
+    const Function *function = find_function(state, callee);
+    if (function == NULL) {
+        fail(state, expression->position, "undefined function '%s'", callee);
+        return false;
+    }
+
+    const Decl *callee_errors = function_error_set(state, function->declaration);
+    if (callee_errors == NULL) {
+        fail(state, expression->position, "'%s' cannot fail, so Try has nothing to do",
+             callee);
+        return false;
+    }
+
+    if (state->current_function == NULL) {
+        fail(state, expression->position,
+             "'%s' fails and there is no enclosing function to propagate to", callee);
+        return false;
+    }
+
+    const Decl *caller_errors =
+        function_error_set(state, state->current_function);
+    if (!error_set_covers(caller_errors, callee_errors)) {
+        report_missing_errors(state, expression->position, callee,
+                              callee_errors, caller_errors);
+        return false;
+    }
+
+    Value value;
+    if (!evaluate(state, call, scope, &value)) return false;
+    if (value.type != VALUE_RESULT) {
+        fail(state, expression->position, "internal error: Try on a non-Result");
+        return false;
+    }
+
+    if (value.as.result.ok) {
+        *out = *value.as.result.value;
+        free(value.as.result.value);
+        return true;
+    }
+
+    /* The failure belongs to the caller now. The flag is read by the statement
+     * loop and cleared at the call boundary that owns it. */
+    state->propagation.propagating = true;
+    state->propagation.error = value;
+    state->propagation.propagating_from = function->declaration;
+    *out = value_nil();
+    return true;
+}
+
+/* `expr Catch { Variant { ... } ... }` -- handle the failure locally.
+ *
+ * Exhaustiveness is checked here, and it is the deliberate point of departure
+ * from Zig, whose idiom is `catch |err| switch (err) { ... else => ... }` --
+ * where `else` compiles today, keeps compiling when a variant is added, and
+ * silently routes a new failure into whatever fallback was written for a
+ * different one. See research/design/error-syntax.md. */
+static bool evaluate_catch(InterpState *state, const Expr *expression, Scope *scope,
+                           Value *out) {
+    const Expr *call = NULL;
+    if (!require_fallible_call(state, expression, &call, expression->position)) return false;
+
+    const char *callee = call->callee->name;
+    const Function *function = find_function(state, callee);
+    if (function == NULL) {
+        fail(state, expression->position, "undefined function '%s'", callee);
+        return false;
+    }
+
+    const Decl *errors = function_error_set(state, function->declaration);
+    if (errors == NULL) {
+        fail(state, expression->position, "'%s' cannot fail, so Catch has nothing to do",
+             callee);
+        return false;
+    }
+
+    /* Names are checked before the call runs, so a mistake in the handler is
+     * reported without having done the fallible work first. */
+    for (size_t i = 0; i < expression->arm_count; i++) {
+        const MatchArm *arm = &expression->arms[i];
+        if (find_field(errors, arm->variant) < 0) {
+            fail(state, arm->position, "'%s' cannot fail with '%s'", callee, arm->variant);
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(expression->arms[j].variant, arm->variant) == 0) {
+                fail(state, arm->position, "'%s' is handled twice", arm->variant);
+                return false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < errors->node->field_count; i++) {
+        const char *name = errors->node->fields[i].name;
+        bool handled = false;
+        for (size_t j = 0; j < expression->arm_count && !handled; j++) {
+            handled = strcmp(expression->arms[j].variant, name) == 0;
+        }
+        if (!handled) {
+            fail(state, expression->position,
+                 "Catch does not handle '%s' of '%s'", name, errors->node->name);
+            return false;
+        }
+    }
+
+    Value value;
+    if (!evaluate(state, call, scope, &value)) return false;
+    if (value.type != VALUE_RESULT) {
+        fail(state, expression->position, "internal error: Catch on a non-Result");
+        return false;
+    }
+
+    if (value.as.result.ok) {
+        *out = *value.as.result.value;
+        free(value.as.result.value);
+        return true;
+    }
+
+    const Decl *failed = value.as.result.error_decl;
+    size_t index = value.as.result.error_variant;
+    if (failed == NULL || index >= failed->node->field_count) {
+        fail(state, expression->position, "internal error: bad error reference");
+        return false;
+    }
+
+    /* Every arm was checked above, so this always finds one. */
+    for (size_t i = 0; i < expression->arm_count; i++) {
+        const MatchArm *arm = &expression->arms[i];
+        if (find_field(failed, arm->variant) != (long long)index) continue;
+
+        Scope *inner = scope_create(scope);
+        if (inner == NULL) {
+            fail(state, arm->position, "out of memory");
+            return false;
+        }
+
+        if (arm->binding != NULL) {
+            fail(state, arm->position,
+                 "'%s' carries no payload yet; binding it is not possible",
+                 arm->variant);
+            scope_destroy(inner);
+            return false;
+        }
+
+        Flow flow = {0};
+        bool ok = true;
+        bool produced = false;
+        Value arm_value = value_nil();
+
+        /* The arm is executed here rather than through execute_block because
+         * the block's value is the value of its last *expression statement*.
+         * execute_block discards expression statements -- it is written for
+         * bodies, where a bare expression is a call for its effect. Reading the
+         * last expression here makes the rule from the design explicit at the
+         * one place it applies. */
+        for (size_t i = 0; i < arm->body_count; i++) {
+            const Stmt *body_statement = arm->body[i];
+            if (body_statement->type == STMT_EXPR) {
+                if (!evaluate(state, body_statement->expression, inner, &arm_value)) {
+                    ok = false;
+                    break;
+                }
+                produced = true;
+            } else {
+                if (!execute_statement(state, body_statement, inner, &flow)) {
+                    ok = false;
+                    break;
+                }
+                if (flow.returned || state->propagation.propagating) break;
+            }
+        }
+
+        /* The parser already rejected an arm that does not end with an
+         * expression, so this only fires if the grammar and this loop drift
+         * apart -- worth a message rather than a Nothing. */
+        if (ok && !produced) {
+            fail(state, arm->position,
+                 "Catch arm '%s' must end with an expression", arm->variant);
+            ok = false;
+        }
+        if (ok) *out = arm_value;
+        scope_destroy(inner);
+        return ok;
+    }
+
+    fail(state, expression->position,
+         "internal error: no arm for the failing error");
+    return false;
+}
+
 static bool evaluate(InterpState *state, const Expr *expression,
                      Scope *scope, Value *out) {
     if (expression == NULL) {
@@ -1432,6 +1813,12 @@ static bool evaluate(InterpState *state, const Expr *expression,
         case EXPR_FIELD:
             return evaluate_field(state, expression, scope, out);
 
+        case EXPR_TRY:
+            return evaluate_try(state, expression, scope, out);
+
+        case EXPR_CATCH:
+            return evaluate_catch(state, expression, scope, out);
+
         case EXPR_CALL:
             return evaluate_call(state, expression, scope, out);
 
@@ -1447,13 +1834,23 @@ static bool execute_block(InterpState *state, Stmt *const *body, size_t count,
                           Scope *scope, Flow *flow) {
     for (size_t i = 0; i < count; i++) {
         if (!execute_statement(state, body[i], scope, flow)) return false;
-        if (flow->returned) break;
+        /* A propagating error leaves the function just as a Return does. Every
+         * loop over statements needs both conditions, or a Try inside a nested
+         * block would keep running the statements after it. */
+        if (flow->returned || state->propagation.propagating) break;
     }
     return true;
 }
 
 static bool execute_statement(InterpState *state, const Stmt *statement,
                               Scope *scope, Flow *flow) {
+    /* Once an error is propagating, this function is on its way out. No further
+     * statement may run, whatever it would have done. Checked here rather than
+     * only at the loop so that statements reached by nesting -- an If body, a
+     * loop body, a nested block -- stop too. The loop checks alone would let
+     * the remainder of an enclosing block run. */
+    if (state->propagation.propagating) return true;
+
     switch (statement->type) {
         case STMT_EXPR: {
             Value ignored;
@@ -1464,6 +1861,13 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             Value initial = value_nil();
             if (statement->initializer != NULL) {
                 if (!evaluate(state, statement->initializer, scope, &initial)) return false;
+
+                /* A Try inside the initialiser may have started an error
+                 * propagation. The declaration must not complete on the Nothing
+                 * that Try returned as a placeholder -- the function is already
+                 * on its way out, and defining a variable here would both
+                 * mis-type it and run code that should never run. */
+                if (state->propagation.propagating) return true;
 
                 /* An integer literal takes the declared type when it fits.
                  *
@@ -1584,7 +1988,7 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                                         statement->loop_count, inner, flow);
                 scope_destroy(inner);
                 if (!ok) return false;
-                if (flow->returned) break;
+                if (flow->returned || state->propagation.propagating) break;
             }
             return true;
         }
@@ -1596,8 +2000,50 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                 if (!evaluate(state, statement->expression, scope, &flow->return_value)) {
                     return false;
                 }
+                /* Same as a variable initialiser: a propagating Try must not
+                 * then be treated as an ordinary Return of Nothing. */
+                if (state->propagation.propagating) flow->return_value = value_nil();
             }
             return true;
+
+        case STMT_FAIL: {
+            /* The error set is fixed by the enclosing signature, so a bare
+             * variant name is unambiguous and the set is not repeated here. */
+            if (state->current_function == NULL) {
+                fail(state, statement->position,
+                     "'Fail' needs an enclosing function to fail");
+                return false;
+            }
+
+            const Decl *errors =
+                function_error_set(state, state->current_function);
+            if (errors == NULL) {
+                fail(state, statement->position,
+                     "'%s' cannot fail; it declares no error set",
+                     state->current_function->name);
+                return false;
+            }
+
+            long long index = find_field(errors, statement->name);
+            if (index < 0) {
+                fail(state, statement->position,
+                     "'%s' cannot fail with '%s'", state->current_function->name,
+                     statement->name);
+                return false;
+            }
+
+            Value error;
+            if (!make_result_error(errors, (size_t)index, &error)) {
+                fail(state, statement->position, "out of memory");
+                return false;
+            }
+            state->propagation.propagating = true;
+            state->propagation.error = error;
+            state->propagation.propagating_from = state->current_function;
+            flow->returned = true;
+            flow->return_value = value_nil();
+            return true;
+        }
 
         case STMT_STRUCT:
         case STMT_UNION:

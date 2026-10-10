@@ -26,7 +26,8 @@ typedef enum {
     VALUE_INTEGER,
     VALUE_STRING,
     VALUE_STRUCT,
-    VALUE_UNION
+    VALUE_UNION,
+    VALUE_RESULT
 } ValueType;
 
 /* A struct or union value.
@@ -44,6 +45,23 @@ typedef struct {
     long long tag;              /* active variant for a union; -1 if none */
 } Aggregate;
 
+/* A fallible call's outcome: either the success value, or one variant of the
+ * callee's declared error set.
+ *
+ * Not modelled as a Union, which was the first instinct and is wrong. A union
+ * names one declaration; a Result holds a value of T *or* a variant of E, so it
+ * spans two declarations and has to record which one the active side came from.
+ * A dedicated kind also avoids synthesising an AST node at run time just to
+ * stand in for a type the user never declared.
+ *
+ * `value` is owned by the Result and is NULL on the failure side. */
+typedef struct {
+    bool ok;
+    Value *value;               /* owned, NULL when !ok */
+    const struct Decl *error_decl;
+    size_t error_variant;
+} ResultValue;
+
 struct Value {
     ValueType type;
     union {
@@ -52,6 +70,7 @@ struct Value {
          * returns an owned buffer documented at the call site. */
         struct { const char *chars; size_t length; } string;
         Aggregate aggregate;
+        ResultValue result;
     } as;
     /* Set when the value came from the True or False literal, so output can
      * show the source form. Presentation only -- truthiness follows the
