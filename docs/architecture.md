@@ -198,6 +198,26 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
    propagating out of an `allocator(x) { }` block must restore the binding, so
    building the block first would mean building unwinding twice.
 
+**[Known defect]** Every struct and union value leaks its `fields` array.
+`free_aggregate_fields` is reached only from the error paths inside
+`evaluate_struct_init` and `evaluate_union_init`; nothing on the success path
+frees, and `scope_destroy` releases the name but not the value. A program that
+builds a struct in a loop grows memory without bound.
+
+Recorded rather than fixed because the fix needs a decision, not a patch: a
+`Value` holding a struct must be deep-copied when copied (decision 21) *and*
+deep-freed when dropped, which puts that responsibility at every `Value` copy
+site. Half of it — the copy half — is already done via `value_copy`. The free
+half is not.
+
+Survivable while the interpreter is a bootstrap tool that will itself be
+replaced; not survivable in the language. Compounding it, the Phase 2 note
+above still stands: no sanitizer runtime is available on this toolchain, so
+this is reasoned from reading the code rather than measured. It should be fixed
+before the allocator model lands, because that is when leak *detection* becomes
+the programmer's job and they will need to trust the interpreter's own
+diagnostics.
+
 ### Phase 4 — Freestanding subset (M)
 
 Prove the language can run with no operating system underneath it. This is the
