@@ -648,11 +648,37 @@ static bool checked_arithmetic(Operator op, long long a, long long b,
         return false;
     }
 
-    /* An unsigned type can never produce a negative result, so a borrow is an
-     * error regardless of how the wrapped bits happen to look. */
-    if (borrow && type_kind_is_unsigned(type)) {
-        *out_reason = "overflow";
-        return false;
+    /* Subtraction that went below zero.
+     *
+     * For an unsigned type this is an error regardless of how the wrapped bits
+     * happen to look -- `Word(0) - 1` lands exactly on the mask and would
+     * otherwise pass every check below.
+     *
+     * For a signed type it is the expected result, and it must not be mistaken
+     * for the overflow that addition produces. The `ur > limit` check further
+     * down reads the two's complement of a negative number as enormous, so
+     * before this branch existed `2 - 5` was reported as an overflow and every
+     * subtraction that went below zero was a hard error.
+     *
+     * Only one question is left once the type is known to be signed: did the
+     * result fall past that type's minimum? `Number` cannot -- both operands
+     * already fit a long long, so their difference does too -- but `Number32`
+     * has a much nearer floor, and `INT32_MIN - 1` is a real overflow.
+     */
+    if (borrow) {
+        if (type_kind_is_unsigned(type)) {
+            *out_reason = "overflow";
+            return false;
+        }
+        unsigned long long floor = (type == TYPE_NUMBER32)
+            ? 0xFFFFFFFF80000000ULL   /* INT32_MIN, as bits */
+            : 0x8000000000000000ULL; /* INT64_MIN, as bits */
+        if (ur < floor) {
+            *out_reason = "overflow";
+            return false;
+        }
+        *out_result = (long long)ur;
+        return true;
     }
 
     /* Reinterpret in the target type's width and check the result fits. A

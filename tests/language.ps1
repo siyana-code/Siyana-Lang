@@ -167,6 +167,47 @@ Test-Case 'String literal'            { Test-Output 'Terminal.Write("text");' @(
 
 Test-Case 'addition'       { Test-Output 'Terminal.Write(2 + 3);' @('5') }
 Test-Case 'subtraction'    { Test-Output 'Terminal.Write(9 - 4);' @('5') }
+Test-Case 'subtraction to zero is not an overflow' {
+    # Every subtraction that reached a non-negative result was fine, which is
+    # exactly the shape of a test suite that never notices this. `0 - 1` is not
+    # an overflow; it is -1.
+    Test-Output 'Terminal.Write(0 - 1);' @('-1')
+}
+Test-Case 'subtraction past zero is negative' {
+    $src = @'
+Variable small: Number = 2;
+Variable large: Number = 5;
+Terminal.Write(small - large);
+'@
+    Test-Output $src @('-3')
+}
+Test-Case 'Number32 subtraction past zero is negative' {
+    # The narrower floor is the case the fix has to get right rather than just
+    # widening: a result below INT32_MIN is still an overflow.
+    Test-Output 'Variable a: Number32 = 0; Terminal.Write(a - 1);' @('-1')
+}
+Test-Case 'Number32 subtraction past its minimum is an error' {
+    # The narrower floor is the case the fix has to get right rather than just
+    # widening: a result below INT32_MIN is still an overflow.
+    $src = @'
+Variable n: Number32 = -2147483648;
+Variable one: Number32 = 1;
+Variable m: Number32 = n - one;
+'@
+    Test-Diagnostic $src 'overflow'
+}
+Test-Case 'Number subtraction to its minimum is not an error' {
+    # The boundary for `Number`. If this one is allowed, the check is not just
+    # refusing everything negative.
+    $src = @'
+Variable big: Number = 4611686018427387904;
+Variable half: Number = 2305843009213693952;
+Variable n: Number = big + half;
+Variable zero: Number = 0;
+Terminal.Write(zero - n);
+'@
+    Test-Output $src @('-6917529027641081856')
+}
 Test-Case 'multiplication' { Test-Output 'Terminal.Write(6 * 7);' @('42') }
 Test-Case 'division'       { Test-Output 'Terminal.Write(20 / 4);' @('5') }
 Test-Case 'unary negation' { Test-Output 'Terminal.Write(-(3 + 4));' @('-7') }
