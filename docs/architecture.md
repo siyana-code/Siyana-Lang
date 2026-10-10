@@ -82,11 +82,25 @@ and committing to them in a document is how projects die quietly.
 | M | A few months of evenings |
 | L | A year or more of evenings |
 
-### Phase 1 — Host and repository scaffolding (S)
+### Phase 1 — Host and repository scaffolding (S) — COMPLETE
 
 Set up the repository structure, the build, and the `siyana` entry point. The
 host language decision is already made (C, see decision 8), so this phase is
 mechanical.
+
+**Verified, not assumed.** All four exit criteria were checked against a fresh
+`git clone` of the remote rather than the working tree:
+
+- Builds from a clean clone with one documented command — confirmed.
+- `siyana --version` prints a version and exits zero — confirmed.
+- Works from a clean checkout with only a C compiler — confirmed under both
+  Clang 16 and GCC 13.2, debug and release.
+- Host language decision recorded — done in decision 8.
+
+Beyond the criteria, the test suite was checked for the failure direction as
+well as the passing one: pointed at a deliberately non-conforming binary, it
+reports 5 of 6 failures and exits non-zero. A suite that cannot fail proves
+nothing.
 
 Proposed layout:
 
