@@ -198,7 +198,33 @@ containing:
 | `deletion` | Restrict deletions |
 | `non_fast_forward` | Block force pushes |
 | `required_linear_history` | Linear history, squash merge only |
-| `pull_request` | 1 approval, dismiss stale reviews, require approval of last push, require conversation resolution |
+| `pull_request` | Pull request required, dismiss stale reviews, require conversation resolution |
+| Bypass | Repository admin role, `always` |
+
+**[Synthesis]** On the review count — this was wrong when first applied, and
+getting it wrong was instructive.
+
+The ruleset was initially configured with `required_approving_review_count: 1`.
+That is the correct recommendation for a team and the wrong setting for a solo
+maintainer: it demands an approving review that, by definition, cannot exist.
+The result was a hard deadlock, not a soft inconvenience. A direct push to
+`main` was rejected; the pull request created as a workaround could not be
+merged; and with an empty bypass list nobody could merge it at all. The
+repository was bricked until the ruleset was edited.
+
+The fix is two changes together:
+
+- `required_approving_review_count: 0` — the pull request requirement stays,
+  which is the part that actually buys something. It forces a look at the diff
+  and a written rationale before anything lands.
+- A bypass actor for the repository admin role, so the maintainer is never
+  locked out of their own repository.
+
+**[Synthesis]** The general lesson is worth more than the specific setting: a
+review requirement only means something if someone is available to satisfy it.
+On a single-maintainer repository, requiring a human approval is not a safety
+measure — it is an outage waiting to happen. When a second contributor appears,
+raise the count to 1 and drop the reliance on the admin bypass.
 
 **[Synthesis]** Not yet enabled, and why:
 
@@ -209,14 +235,17 @@ containing:
 - `merge_queue` — a single-author repository gains nothing and it adds latency.
 - `required_signatures` — enable once there are outside contributors.
 
-**[Synthesis]** On the Copilot caveat: when Copilot opens an unattributed pull
-request, GitHub requires one extra approval by default, because the usual
-assumption (the author and the approver are two different people) no longer
-holds. Worth revisiting when automation is introduced.
+**[Primary]** The ruleset is managed through the REST API. Three details worth
+recording:
 
-**[Primary]** The ruleset is managed through the REST API. Note that the
-`pull_request` rule requires `require_code_owner_review` to be present
-explicitly — omitting it returns a 422 validation error rather than a default.
+- The `pull_request` rule requires `require_code_owner_review` to be present
+  explicitly — omitting it returns a 422 validation error rather than a default.
+- `~DEFAULT_BRANCH` is accepted in the `ref_name` condition, so the ruleset
+  follows the default branch if it is ever renamed.
+- Rulesets and classic branch protection are separate systems. After creating a
+  ruleset, `GET /branches/main/protection` still returns 404 — that is not a
+  failure, it means the ruleset path is the one in use. Verify with
+  `GET /rules/branches/{branch}` instead.
 
 ## Versioning: SemVer 2.0.0
 
