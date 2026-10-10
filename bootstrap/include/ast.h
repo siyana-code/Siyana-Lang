@@ -69,7 +69,17 @@ typedef enum {
     OP_LESS,
     OP_LESS_EQUAL,
     OP_GREATER,
-    OP_GREATER_EQUAL
+    OP_GREATER_EQUAL,
+
+    /* Bitwise. Bound as in C: shifts tighter than comparison, then &, then ^,
+     * then |. Without these no kernel is possible -- page table entries, MMIO
+     * registers, and status flags are all bit patterns. */
+    OP_BITWISE_AND,
+    OP_BITWISE_OR,
+    OP_BITWISE_XOR,
+    OP_SHIFT_LEFT,
+    OP_SHIFT_RIGHT,
+    OP_BITWISE_NOT
 } Operator;
 
 /* The integer types.

@@ -32,7 +32,8 @@ static const char *const kTypeNames[] = {
     "Result", "Try", "Catch", "Fail", "Allocator",
     "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
-    "'<'", "'<='", "'>'", "'>='"
+    "'<'", "'<='", "'>'", "'>='",
+    "'&'", "'|'", "'^'", "'~'", "'<<'", "'>>'"
 };
 
 const char *token_type_name(TokenType type) {
@@ -184,12 +185,38 @@ static void scan_identifier(Lexer *lexer, TokenList *list) {
     }
 }
 
+static bool is_hex_digit(char c) {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+/* Scans an integer literal: decimal, or hexadecimal with a `0x` prefix, with
+ * `_` allowed as a digit separator.
+ *
+ * Hexadecimal is not optional for a systems language. Every hardware constant
+ * is written that way -- page table flags, CR0 bits, MMIO register masks --
+ * and a language that cannot spell `0x8000_0000_0000_0000` forces each of them
+ * to be written as a sum of powers of two, which is unreadable and easy to get
+ * wrong in a way that still compiles.
+ *
+ * Underscores are dropped here rather than handled by the parser, so the token
+ * text is already a plain digit string.
+ */
 static void scan_number_literal(Lexer *lexer, TokenList *list) {
     Position start = lexer->position;
     size_t number_start = lexer->offset;
 
-    while (!is_at_end(lexer) && is_digit(peek(lexer))) {
+    /* The `0x` is kept in the token text; the parser reads the base off it. */
+    if (peek(lexer) == '0' && lexer->offset + 1 < lexer->source_length &&
+        (lexer->source[lexer->offset + 1] == 'x' || lexer->source[lexer->offset + 1] == 'X')) {
         advance(lexer);
+        advance(lexer);
+        while (!is_at_end(lexer) && (is_hex_digit(peek(lexer)) || peek(lexer) == '_')) {
+            advance(lexer);
+        }
+    } else {
+        while (!is_at_end(lexer) && (is_digit(peek(lexer)) || peek(lexer) == '_')) {
+            advance(lexer);
+        }
     }
 
     Token *token = list_push(list);
@@ -197,14 +224,21 @@ static void scan_number_literal(Lexer *lexer, TokenList *list) {
     token->type = TOKEN_NUMBER;
     token->start = start;
     token->start_offset = number_start;
-    token->length = lexer->offset - number_start;
 
     /* Integer digits are owned too, so the parser can parse them without ever
-     * holding a pointer into the source buffer. */
-    token->text = malloc(token->length + 1);
+     * holding a pointer into the source buffer. Separators are stripped on the
+     * way through, so what lands here is what the parser will parse. */
+    size_t raw_length = lexer->offset - number_start;
+    token->text = malloc(raw_length + 1);
     if (token->text == NULL) return;
-    memcpy(token->text, lexer->source + number_start, token->length);
-    token->text[token->length] = '\0';
+
+    size_t kept = 0;
+    for (size_t i = 0; i < raw_length; i++) {
+        char c = lexer->source[number_start + i];
+        if (c != '_') token->text[kept++] = c;
+    }
+    token->text[kept] = '\0';
+    token->length = kept;
 }
 
 /* Scans a single-quoted character literal, e.g. 'a' or '\n'.
@@ -414,8 +448,18 @@ static void scan_token(Lexer *lexer, TokenList *list) {
             case '/': type = TOKEN_SLASH; break;
             case '=': type = match(lexer, '=') ? TOKEN_EQ : TOKEN_ASSIGN; break;
             case '!': type = match(lexer, '=') ? TOKEN_BANG_EQ : TOKEN_BANG; break;
-            case '<': type = match(lexer, '=') ? TOKEN_LT_EQ : TOKEN_LT; break;
-            case '>': type = match(lexer, '=') ? TOKEN_GT_EQ : TOKEN_GT; break;
+            case '&': type = TOKEN_AMPERSAND; break;
+            case '|': type = TOKEN_PIPE; break;
+            case '^': type = TOKEN_CARET; break;
+            case '~': type = TOKEN_TILDE; break;
+            case '<':
+                if (match(lexer, '<')) type = TOKEN_SHIFT_LEFT;
+                else type = match(lexer, '=') ? TOKEN_LT_EQ : TOKEN_LT;
+                break;
+            case '>':
+                if (match(lexer, '>')) type = TOKEN_SHIFT_RIGHT;
+                else type = match(lexer, '=') ? TOKEN_GT_EQ : TOKEN_GT;
+                break;
             default:
                 if (c >= 32 && c < 127) {
                     error_at(lexer, start, "unexpected character '%c'", c);

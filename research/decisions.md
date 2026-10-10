@@ -592,6 +592,68 @@ two copies are the same arena. Copying an allocator would otherwise copy its
 memory and hand out the same bytes twice. Structs copy (decision 21);
 allocators alias; the distinction is in the type, not in folklore.
 
+## 25. Bitwise operators, and how shifts treat sign
+
+**Decision.** `&`, `|`, `^`, `~`, `<<`, `>>`, bound with C precedence. Hex
+literals (`0xFF`) and `_` digit separators.
+
+```
+Variable flags: Word = 0;
+flags = flags | (1 << 3);          // set
+flags = flags & ~(1 << 3);         // clear
+Variable frame: Word = pte & 0x0000FFFFFFFFFFFF;
+```
+
+**How this was chosen: by trying to write the OS.** A page table entry is
+`frame | flags << 48`, and the probe for Phase 3's last exit criterion — *is the
+test suite expressive enough to write the OS in?* — failed at the first line.
+The gap list that came out of writing OS-shaped code and seeing what would not
+compile was: bitwise operators, hex literals, `const`, `enum`, arrays, `String`
+as a type, `SizeOf`, `For`, and digit separators. This is the blocking item; the
+rest are recorded in the architecture plan.
+
+### The three rules that carry the weight
+
+**`>>` is logical on `Word` and `Character`, arithmetic on `Number` and
+`Number32`.** Not a stylistic choice. `(1 << 63) >> 63` must be 1; an arithmetic
+shift would make it 0xFFFF…FFFF, and every mask extraction in a kernel would be
+wrong in a way that looks plausible. Signed types shift arithmetically because
+that is what `-16 >> 2 == -4` means to a programmer, and it is what every real
+compiler does.
+
+**A shift count may be any integer type.** The one deliberate exception to
+decision 20's "both operands must be the same type". A count is not data — it
+is discarded the moment the shift is done — and `Loop (i) { flags << i }` with
+`i: Word` is the ordinary shape of code that sets a register bit. The count
+must still be non-negative and less than the shifted type's width.
+
+**A left shift that carries bits out of the type is an error**, exactly like
+arithmetic overflow. C would silently drop them, and a dropped flag bit is a
+security bug that compiles.
+
+### Constant expressions take the type they are used in
+
+`flags | (1 << 3)` must work. Without this it is a type error naming a `Number`
+meeting a `Word` — and the fix a programmer reaches for is a cast. A cast used
+as a habit rather than a judgement is how widths get silently mixed, which is
+exactly what decision 20 exists to prevent.
+
+So three shapes are recognised as constants and take their context's type: a
+bare literal, a shift of literals, and the complement of either. A complement
+is additionally re-formed in the target width: evaluated at 64-bit *signed*,
+`~(1 << 3)` is -9 and may not adopt `Word` — decision 20's protection, and it is
+right — but `flags & ~(1 << 3)` must still mean "clear bit 3".
+
+`Variable high: Word = 1 << 63;` is the same problem from the other side: 2^63
+does not fit a signed `Number` but is an ordinary `Word`, so a constant in a
+declaration is evaluated in the declared type.
+
+### Also
+
+An unsigned value prints unsigned. A `Word` of all ones is
+18446744073709551615, not -1; printing it signed reports a mask as a negative
+number and sends the reader looking for a sign bug that is not there.
+
 ## Open decisions
 
 Not yet made:

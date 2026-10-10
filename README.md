@@ -135,8 +135,14 @@ union also has *no guaranteed byte layout* — on-disk and wire formats go
 through a `Struct`, whose layout is specified. See
 [decision 22](research/decisions.md).
 
-Deliberately **not** implemented yet: buffers, borrows, slices, modules,
-pointers, and string concatenation.
+**Bitwise, with the signedness that hardware needs.** `>>` is logical on `Word`
+and `Character` and arithmetic on the signed types — `(1 << 63) >> 63` is 1, not
+all ones. A left shift that carries bits out of the type is an error, not a
+truncation, because a dropped flag bit is a security bug that compiles. See
+[decision 25](research/decisions.md).
+
+Deliberately **not** implemented yet: arrays, a `String` type, buffers, borrows,
+slices, modules, and pointers.
 
 **Allocation is explicit and failure is a value.** An `Allocator` owns a region;
 `Allocate` returns an offset into it and `OutOfMemory` is a normal error to
