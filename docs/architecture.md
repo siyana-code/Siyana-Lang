@@ -189,12 +189,34 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
 - Allocators with lexically scoped `allocator(x) { }` binding, handing out
   offsets, restoring on every exit path including error propagation
   (decision 24).
+- Bitwise operators, shifts with per-signedness behaviour, hex literals, and
+  digit separators (decision 25).
+
+**The OS-expression probe**
+
+Phase 3's last exit criterion is *a test suite expressive enough to write the OS
+in*. Rather than assume, an OS-shaped program was written and run to find what
+would not compile. That found the blocking gap (no bitwise operators at all — a
+page table entry is `frame | flags << 48`) and produced the remaining list:
+
+| Missing | Blocks |
+| --- | --- |
+| Arrays / lists | a page table is a collection |
+| `String` as a type, length, concatenation | file paths, command lines |
+| `const` named constants | `PAGE_SIZE`, register bit masks |
+| `enum` | device states, status codes |
+| `SizeOf` | struct layout, which decision 22 requires to be specified |
+| `For` | convenience only; `Loop` covers it |
+| Compound assignment (`<<=`, `|=`) | convenience only |
+
+Nothing on this list is a redesign. They are additions to a language whose hard
+decisions are made, which is the state Phase 3 was supposed to reach.
 
 **Remaining**
 
-1. Compile-time evaluation — still undecided, and the last Phase 3 item that is
-   a *choice* rather than a build.
-2. Buffers and borrows, which unblock the ergonomics the allocator model was
+1. Arrays and a `String` type — the two that block writing anything substantial.
+2. Named constants.
+3. Buffers and borrows, which unblock the ergonomics the allocator model was
    chosen for. Allocators currently hand out offsets because nothing yet means
    "a reference to a struct" (decision 24).
 

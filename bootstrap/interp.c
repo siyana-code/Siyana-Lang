@@ -80,6 +80,19 @@ typedef struct {
      * a silent fallback would be the ambient model decision 14 rejected. */
     struct Allocator *current_allocator;
 
+    /* The type a constant expression is being stored into, or TYPE_NUMBER for
+     * no hint.
+     *
+     * `Variable high: Word = 1 << 63;` is ordinary kernel code. Evaluated as a
+     * Number the shift overflows, because 2^63 does not fit a signed 64-bit
+     * integer -- but the programmer said Word, where it is perfectly ordinary.
+     * Evaluating bottom-up means the shift cannot see the declaration, so the
+     * type is pushed down to it here.
+     *
+     * Only constant expressions consult this. `a << 63` where `a` is a variable
+     * is a real shift of a real value and keeps the type of `a`. */
+    TypeKind constant_type_hint;
+
     /* Every allocator made, freed at teardown.
      *
      * An arena has exactly one owner -- the run -- so unlike a struct's field
@@ -446,6 +459,12 @@ static const char *operator_symbol(Operator op) {
         case OP_LESS_EQUAL:    return "<=";
         case OP_GREATER:       return ">";
         case OP_GREATER_EQUAL: return ">=";
+        case OP_BITWISE_AND:   return "&";
+        case OP_BITWISE_OR:    return "|";
+        case OP_BITWISE_XOR:   return "^";
+        case OP_SHIFT_LEFT:    return "<<";
+        case OP_SHIFT_RIGHT:   return ">>";
+        case OP_BITWISE_NOT:   return "~";
         default:               return "?";
     }
 }
@@ -471,6 +490,85 @@ static Value value_bool_result(bool truth) {
 static Value value_as_plain(Value value) {
     value.is_bool_literal = false;
     return value;
+}
+
+/* The bit pattern of a type's full range: every bit its width can hold.
+ *
+ * One place, because a mask spelled out twice is a mask that will disagree. */
+static unsigned long long width_mask(TypeKind type) {
+    switch (type) {
+        case TYPE_CHARACTER: return 0xFFULL;
+        case TYPE_NUMBER32:   return 0xFFFFFFFFULL;
+        case TYPE_WORD:       return (sizeof(void *) >= 8) ? ~0ULL : 0xFFFFFFFFULL;
+        case TYPE_NUMBER:     return ~0ULL;
+        default:              return 0;
+    }
+}
+
+/* Bit arithmetic on fixed-width integers.
+ *
+ * `&`, `|`, and `^` cannot overflow: the result of any bitwise combination of
+ * two W-bit values is itself a W-bit value. That is not a licence to skip the
+ * type check, though -- mixing widths is the origin of a large class of
+ * integer bugs, and `Character & Word` would silently widen a byte into a
+ * pointer-sized value.
+ *
+ * Shifts are different. `x << n` can overflow, and a shift of at least the
+ * width is undefined in C and meaningless here, so both are errors.
+ */
+static bool bitwise_type_of(InterpState *state, Operator op, Value a, Value b,
+                            Position position, TypeKind *out) {
+    bool is_shift = op == OP_SHIFT_LEFT || op == OP_SHIFT_RIGHT;
+
+    if (a.type != VALUE_INTEGER || (is_shift ? false : b.type != VALUE_INTEGER)) {
+        fail(state, position, "operator '%s' requires integer operands, got %s and %s",
+             operator_symbol(op), type_name_of(a), type_name_of(b));
+        return false;
+    }
+
+    /* A shift's right operand is a count, not data, so it takes whatever
+     * integer type it has and only the left operand fixes the result. Every
+     * other bitwise operator needs both sides to agree. */
+    if (!is_shift && a.as.integer.type != b.as.integer.type) {
+        fail(state, position,
+             "operator '%s' cannot mix %s with %s", operator_symbol(op),
+             type_kind_name(a.as.integer.type), type_kind_name(b.as.integer.type));
+        return false;
+    }
+
+    *out = a.as.integer.type;
+    return true;
+}
+
+/* The shift count. Deliberately allowed to be any integer type, unlike every
+ * other binary operator.
+ *
+ * A count is not data: it is discarded the moment the shift is done, so making
+ * it the same type as the shifted value buys nothing and costs the common case.
+ * `Loop (i) { frame << i }` with `i: Word` is the ordinary shape of code that
+ * sets a register bit, and requiring `Number(i)` there would be noise. The
+ * count must be non-negative and less than the shifted type's width. */
+static bool shift_count_of(InterpState *state, Value count, TypeKind shifted,
+                           Position position, long long *out) {
+    if (count.type != VALUE_INTEGER) {
+        fail(state, position, "a shift count must be an integer, got %s",
+             type_name_of(count));
+        return false;
+    }
+    long long bits = count.as.integer.bits;
+    int width = (int)(type_kind_size(shifted) * 8);
+    if (bits < 0) {
+        fail(state, position, "a shift count must not be negative, got %lld", bits);
+        return false;
+    }
+    if (bits >= width) {
+        fail(state, position,
+             "shift of %lld is too large: %s is %d bits wide", bits,
+             type_kind_name(shifted), width);
+        return false;
+    }
+    *out = bits;
+    return true;
 }
 
 /* Arithmetic on fixed-width integers.
@@ -584,11 +682,38 @@ static int compare_integers(long long a, long long b) {
 /* True when `expression` is a bare integer literal that has not yet been given
  * a type by its context.
  *
- * `is_untyped_literal` must agree with adopt_operand_type's precondition. They
- * are checked together here so the two cannot drift. */
+ * Kept as its own predicate because it is the base case of
+ * is_constant_integer and because the two are easy to confuse. */
 static bool is_untyped_literal(const Expr *expression, Value value) {
     return expression != NULL && expression->type == EXPR_NUMBER &&
            value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER;
+}
+
+/* True when `expression` is built only from integer literals, so its value is a
+ * constant rather than a value of any particular width.
+ *
+ * This covers the three shapes kernel code writes constantly:
+ *
+ *     8                  a bare literal
+ *     1 << 3             a shift of literals
+ *     ~mask              the complement of either
+ *
+ * All three must take the type they are used in, the way a bare literal does.
+ * Without it, `flags | (1 << 3)` is a type error naming a Number meeting a Word
+ * -- and the fix people reach for is a cast. A cast used as a habit rather than
+ * a judgement is exactly how widths end up silently mixed, which is the
+ * failure decision 20 exists to prevent. */
+static bool is_constant_integer(const Expr *expression) {
+    if (expression == NULL) return false;
+    if (expression->type == EXPR_NUMBER) return is_untyped_literal(expression, value_number(0));
+    if (expression->type == EXPR_UNARY && expression->op == OP_BITWISE_NOT) {
+        return is_constant_integer(expression->right);
+    }
+    if (expression->type == EXPR_BINARY &&
+        (expression->op == OP_SHIFT_LEFT || expression->op == OP_SHIFT_RIGHT)) {
+        return is_constant_integer(expression->left);
+    }
+    return false;
 }
 
 /* Gives an untyped integer literal the type of the operand it is paired with.
@@ -607,13 +732,40 @@ static bool is_untyped_literal(const Expr *expression, Value value) {
  * whichever type it becomes. */
 static bool adopt_operand_type(const Expr *expression, Value *value,
                                Value from_other_side) {
-    if (!is_untyped_literal(expression, *value)) return false;
+    /* Only an untyped Number may adopt. A value that already has a type, or a
+     * String, must not silently change width. */
+    if (value->type != VALUE_INTEGER || value->as.integer.type != TYPE_NUMBER) {
+        return false;
+    }
+    if (!is_constant_integer(expression)) return false;
     if (from_other_side.type != VALUE_INTEGER) return false;
 
     TypeKind wanted = from_other_side.as.integer.type;
     if (wanted == TYPE_NUMBER) return false;
-    if (!integer_fits((*value).as.integer.bits, wanted)) return false;
 
+    /* A complement is re-formed in the target's width, not narrowed into it.
+     *
+     * `flags & ~(1 << 3)` is how a flag bit is cleared -- in Siyana as in
+     * every other language doing this work. Evaluated at 64-bit signed,
+     * `~(1 << 3)` is -9, and a negative value may not adopt Word: that is
+     * decision 20's protection, and it is right. But the value the programmer
+     * means is 0xFFFFFFFFFFFFFFF7, which is a perfectly good Word.
+     *
+     * The stored bits are already the complement, computed in the default
+     * width, so adopting a wider type only means re-masking them -- taking the
+     * complement *again* here would undo it and `flags & ~(1 << 3)` would
+     * clear every bit except the one named.
+     *
+     * This agrees with the operator's own type rule: `~` yields a value of the
+     * same type as its operand, so that type has to be settled first. */
+    if (expression->type == EXPR_UNARY && expression->op == OP_BITWISE_NOT) {
+        (*value).as.integer.bits =
+            (long long)((unsigned long long)(*value).as.integer.bits & width_mask(wanted));
+        (*value).as.integer.type = wanted;
+        return true;
+    }
+
+    if (!integer_fits((*value).as.integer.bits, wanted)) return false;
     (*value).as.integer.type = wanted;
     return true;
 }
@@ -632,8 +784,114 @@ static bool evaluate_binary(InterpState *state, const Expr *expression,
      * letting `1` adopt Character's type would turn a real mistake into a
      * plausible-looking answer. */
     if (expression->op != OP_EQUAL && expression->op != OP_NOT_EQUAL) {
-        adopt_operand_type(expression->left, &left, right);
-        adopt_operand_type(expression->right, &right, left);
+        /* Not for shifts. The right operand of a shift is a count, not data, so
+         * it takes whatever integer type it has; letting it adopt the left
+         * operand's type would turn `word << i` with `i: Word` into a type
+         * error. See shift_count_of. */
+        bool is_shift = expression->op == OP_SHIFT_LEFT ||
+                        expression->op == OP_SHIFT_RIGHT;
+        if (!is_shift) {
+            adopt_operand_type(expression->left, &left, right);
+            adopt_operand_type(expression->right, &right, left);
+        }
+    }
+
+    /* Bitwise operators. Handled before the arithmetic path because they have
+     * their own type rule and, for shifts, their own overflow rule. */
+    if (expression->op == OP_BITWISE_AND || expression->op == OP_BITWISE_OR ||
+        expression->op == OP_BITWISE_XOR || expression->op == OP_SHIFT_LEFT ||
+        expression->op == OP_SHIFT_RIGHT) {
+        TypeKind type = TYPE_NUMBER;
+        if (!bitwise_type_of(state, expression->op, left, right,
+                             expression->position, &type)) {
+            return false;
+        }
+
+        unsigned long long mask = width_mask(type);
+        unsigned long long a = (unsigned long long)left.as.integer.bits;
+        unsigned long long b = (unsigned long long)right.as.integer.bits;
+        unsigned long long result;
+
+        switch (expression->op) {
+            case OP_BITWISE_AND: result = a & b; break;
+            case OP_BITWISE_OR:  result = a | b; break;
+            case OP_BITWISE_XOR: result = a ^ b; break;
+            case OP_SHIFT_LEFT: {
+                /* A shift of literals is a constant, so it may be evaluated in
+                 * the type it is being stored as rather than the default. */
+                TypeKind shift_type = type;
+                if (type == TYPE_NUMBER && state->constant_type_hint != TYPE_NUMBER &&
+                    is_constant_integer(expression->left)) {
+                    shift_type = state->constant_type_hint;
+                }
+
+                long long count = 0;
+                if (!shift_count_of(state, right, type, expression->position, &count)) {
+                    return false;
+                }
+                unsigned long long shifted = ((unsigned long long)left.as.integer.bits)
+                                             << count;
+                if ((shifted >> count) != (unsigned long long)left.as.integer.bits) {
+                    fail(state, expression->position, "overflow");
+                    return false;
+                }
+                result = shifted;
+                type = shift_type;
+                mask = width_mask(type);
+                break;
+            }
+            case OP_SHIFT_RIGHT: {
+                long long count = 0;
+                if (!shift_count_of(state, right, type, expression->position, &count)) {
+                    return false;
+                }
+                if (type_kind_is_unsigned(type)) {
+                    /* Logical: zeros come in from the top. A page table mask
+                     * shifted right must not fill with ones. */
+                    result = a >> count;
+                } else {
+                    /* Arithmetic: the sign bit replicates. This is what a
+                     * programmer dividing a negative number by two means, and
+                     * it matches every real compiler. */
+                    result = (unsigned long long)(left.as.integer.bits >> count);
+                }
+                break;
+            }
+            default:
+                fail(state, expression->position, "unhandled bitwise operator");
+                return false;
+        }
+
+        /* A left shift can carry bits out of the type; every other bitwise
+         * result is representable by construction. */
+        if (expression->op == OP_SHIFT_LEFT && type_kind_is_unsigned(type)) {
+            if (result > mask) {
+                fail(state, expression->position, "overflow");
+                return false;
+            }
+        } else if (expression->op == OP_SHIFT_LEFT) {
+            long long limit = (type == TYPE_NUMBER32) ? 0x7FFFFFFF
+                                                      : 0x7FFFFFFFFFFFFFFFLL;
+            if (result > (unsigned long long)limit) {
+                fail(state, expression->position, "overflow");
+                return false;
+            }
+        }
+
+        /* A signed type stores the same bits the unsigned computation produced, so a
+         * negative result stays negative rather than becoming huge.
+         *
+         * Only signed types. A Character or Word with its top bit set is a
+         * perfectly ordinary large value -- 236 is a byte with bit 7 set -- and
+         * reinterpreting that as negative turns `200 | 100` into -20. */
+        if (!type_kind_is_unsigned(type) &&
+            (result & (1ULL << (type_kind_size(type) * 8 - 1))) != 0) {
+            long long bits = (long long)(result | ~mask);
+            *out = value_integer(bits, type);
+        } else {
+            *out = value_integer((long long)result, type);
+        }
+        return true;
     }
 
     /* Equality between strings compares content; between integers it needs
@@ -757,6 +1015,23 @@ static bool evaluate_unary(InterpState *state, const Expr *expression,
     if (expression->op == OP_NOT) {
         /* C semantics: !0 is 1, anything else is 0. */
         *out = value_bool_result(!is_truthy(operand));
+        return true;
+    }
+
+    if (expression->op == OP_BITWISE_NOT) {
+        if (operand.type != VALUE_INTEGER) {
+            fail(state, expression->position,
+                 "operator '~' requires an integer operand, got %s",
+                 type_name_of(operand));
+            return false;
+        }
+        /* The complement of a value of width W is always representable in W
+         * bits, so unlike arithmetic this can never overflow -- which is the
+         * one reason `~` is safe on an unsigned type where `-` is not. */
+        TypeKind type = operand.as.integer.type;
+        unsigned long long mask = width_mask(type);
+        unsigned long long bits = (unsigned long long)operand.as.integer.bits;
+        *out = value_integer((long long)(~bits & mask), type);
         return true;
     }
 
@@ -960,6 +1235,12 @@ static void write_value(Value value) {
                 /* A Character prints as the character it denotes. Printing 65
                  * for 'A' would make Character painful to debug. */
                 putchar((int)value.as.integer.bits);
+            } else if (type_kind_is_unsigned(value.as.integer.type)) {
+                /* Printed unsigned. A Word of all ones is 18446744073709551615,
+                 * not -1 -- printing it signed would report a mask as a
+                 * negative number, which is exactly the reading that sends a
+                 * programmer looking for a sign bug that is not there. */
+                printf("%llu", (unsigned long long)value.as.integer.bits);
             } else {
                 printf("%lld", value.as.integer.bits);
             }
@@ -2286,7 +2567,15 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
         case STMT_VARIABLE: {
             Value initial = value_nil();
             if (statement->initializer != NULL) {
-                if (!evaluate(state, statement->initializer, scope, &initial)) return false;
+                /* Push the declared type down so a constant expression in the
+                 * initialiser is evaluated in it. `Variable w: Word = 1 << 63`
+                 * overflows as a Number and does not as a Word. */
+                TypeKind saved_hint = state->constant_type_hint;
+                state->constant_type_hint = statement->declared_type;
+                bool initialised =
+                    evaluate(state, statement->initializer, scope, &initial);
+                state->constant_type_hint = saved_hint;
+                if (!initialised) return false;
 
                 /* A Try inside the initialiser may have started an error
                  * propagation. The declaration must not complete on the Nothing

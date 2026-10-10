@@ -69,6 +69,7 @@ static bool is_name_token(TokenType type);
 
 static bool parse_block(Parser *parser, Stmt ***body, size_t *count);
 static Expr *parse_postfix(Parser *parser, Expr *base);
+static Expr *parse_shift(Parser *parser);
 
 /* expr_free releases Catch arms, which hold statements, so the two recurse into
  * each other and one of them has to be declared first. */
@@ -434,7 +435,11 @@ static Expr *parse_primary(Parser *parser) {
         Expr *expr = expr_new(parser, EXPR_NUMBER, token->start);
         if (expr == NULL) return NULL;
         /* Digits arrive as owned text, so no access to the source buffer. */
-        expr->number = strtoll(token->text, NULL, 10);
+        expr->number = strtoll(token->text, NULL,
+                             token->length >= 2 && token->text[0] == '0' &&
+                             (token->text[1] == 'x' || token->text[1] == 'X')
+                                 ? 16
+                                 : 10);
         return expr;
     }
 
@@ -912,14 +917,18 @@ static Expr *parse_call(Parser *parser) {
 static Expr *parse_unary(Parser *parser) {
     Position start = current(parser)->start;
 
-    if (match(parser, TOKEN_BANG) || match(parser, TOKEN_MINUS)) {
+    if (match(parser, TOKEN_BANG) || match(parser, TOKEN_MINUS) || match(parser, TOKEN_TILDE)) {
         /* Read the operator back off the token just consumed, rather than
          * re-testing current() which has already advanced. */
-        bool is_not = parser->tokens[parser->position - 1].type == TOKEN_BANG;
+        TokenType applied = parser->tokens[parser->position - 1].type;
+        Operator op = applied == TOKEN_BANG    ? OP_NOT
+                    : applied == TOKEN_MINUS  ? OP_NEGATE
+                    : applied == TOKEN_TILDE  ? OP_BITWISE_NOT
+                                              : OP_NOT;
 
         Expr *expr = expr_new(parser, EXPR_UNARY, start);
         if (expr == NULL) return NULL;
-        expr->op = is_not ? OP_NOT : OP_NEGATE;
+        expr->op = op;
         expr->right = parse_unary(parser);
         if (parser->failed) {
             expr_free(expr);
@@ -994,7 +1003,7 @@ static Expr *parse_comparison(Parser *parser) {
         {TOKEN_LT, OP_LESS},    {TOKEN_LT_EQ, OP_LESS_EQUAL},
         {TOKEN_GT, OP_GREATER}, {TOKEN_GT_EQ, OP_GREATER_EQUAL}
     };
-    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_term);
+    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_shift);
 }
 
 static Expr *parse_equality(Parser *parser) {
@@ -1002,6 +1011,35 @@ static Expr *parse_equality(Parser *parser) {
         {TOKEN_EQ, OP_EQUAL}, {TOKEN_BANG_EQ, OP_NOT_EQUAL}
     };
     return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_comparison);
+}
+
+/* Shifts bind tighter than comparison and looser than additive, as in C. */
+static Expr *parse_shift(Parser *parser) {
+    static const BinaryOperator level[] = {
+        {TOKEN_SHIFT_LEFT, OP_SHIFT_LEFT}, {TOKEN_SHIFT_RIGHT, OP_SHIFT_RIGHT}
+    };
+    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_term);
+}
+
+static Expr *parse_bitwise_and(Parser *parser) {
+    static const BinaryOperator level[] = {
+        {TOKEN_AMPERSAND, OP_BITWISE_AND}
+    };
+    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_equality);
+}
+
+static Expr *parse_bitwise_xor(Parser *parser) {
+    static const BinaryOperator level[] = {
+        {TOKEN_CARET, OP_BITWISE_XOR}
+    };
+    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_bitwise_and);
+}
+
+static Expr *parse_bitwise_or(Parser *parser) {
+    static const BinaryOperator level[] = {
+        {TOKEN_PIPE, OP_BITWISE_OR}
+    };
+    return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_bitwise_xor);
 }
 
 /* Assignment is right-associative: `a = b = 1` assigns 1 to b then to a.
@@ -1081,7 +1119,7 @@ static Expr *parse_assignment(Parser *parser) {
         }
     }
 
-    return parse_equality(parser);
+    return parse_bitwise_or(parser);
 }
 
 static Expr *parse_expression(Parser *parser) {

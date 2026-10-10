@@ -908,6 +908,119 @@ Test-Case 'an unknown Allocator method is an error' {
     Test-Diagnostic 'Variable a: Allocator = Allocator(16); Terminal.Write(a.Nonsense());' "no method 'Nonsense'"
 }
 
+# --- Bitwise ----------------------------------------------------------------
+#
+# Found by writing an OS-shaped program and seeing what would not compile. A
+# page table entry is `frame | flags << 48`, and without these no kernel is
+# possible at all. The signedness rules below are the substance; the operators
+# themselves are mechanical.
+
+Test-Case 'bitwise and, or, xor on Word' {
+    $src = @'
+Variable a: Word = 12;
+Variable b: Word = 10;
+Variable c: Word = a & b;
+Variable d: Word = a | b;
+Variable e: Word = a ^ b;
+Terminal.Write(c);
+Terminal.Write(d);
+Terminal.Write(e);
+'@
+    Test-Output $src @('8', '14', '6')
+}
+Test-Case 'complement' {
+    $src = @'
+Variable a: Word = 0;
+Terminal.Write(~a);
+'@
+    Test-Output $src @('18446744073709551615')
+}
+Test-Case 'set, test, and clear a flag bit' {
+    # The shape every register write has.
+    $src = @'
+Variable flags: Word = 0;
+flags = flags | (1 << 3);
+Terminal.Write(flags);
+Terminal.Write(flags & (1 << 3));
+flags = flags & ~(1 << 3);
+Terminal.Write(flags);
+'@
+    Test-Output $src @('8', '8', '0')
+}
+Test-Case 'a page table entry packs a frame and flags' {
+    $src = @'
+Function MakePte(frame: Word, flags: Word) -> Word {
+    Return frame | (flags << 48);
+}
+Variable pte: Word = MakePte(42, 3);
+Terminal.Write(pte & 0x0000FFFFFFFFFFFF);
+Terminal.Write(pte >> 48);
+'@
+    Test-Output $src @('42', '3')
+}
+Test-Case 'hexadecimal literals' {
+    Test-Output 'Variable a: Number = 0xFF; Terminal.Write(a);' @('255')
+}
+Test-Case 'underscore digit separators' {
+    Test-Output 'Variable a: Number = 1_000_000; Terminal.Write(a);' @('1000000')
+    Test-Output 'Variable a: Number = 0xFF_FF; Terminal.Write(a);' @('65535')
+}
+Test-Case 'right shift is logical on Word' {
+    # The point of Word being unsigned: a mask shifted right brings in zeros.
+    # An arithmetic shift would turn 1 into 0xFFFF...FFFF.
+    Test-Output 'Variable a: Word = 1 << 63; Terminal.Write(a >> 63);' @('1')
+}
+Test-Case 'right shift is logical on Character' {
+    Test-Output 'Variable a: Character = 200; Variable b: Character = 12; Terminal.Write(a >> 4 == b);' @('True')
+}
+Test-Case 'right shift is arithmetic on signed types' {
+    Test-Output 'Variable a: Number = -16; Terminal.Write(a >> 2);' @('-4')
+    Test-Output 'Variable a: Number32 = -16; Terminal.Write(a >> 2);' @('-4')
+}
+Test-Case 'a shift cannot overflow the type' {
+    Test-Diagnostic 'Variable a: Character = 200; Variable b: Character = a << 4;' 'overflow'
+}
+Test-Case 'a constant shift is evaluated in the type it is stored as' {
+    # `1 << 63` does not fit a signed 64-bit Number but is an ordinary Word.
+    Test-Output 'Variable a: Word = 1 << 63; Terminal.Write(a >> 63);' @('1')
+}
+Test-Case 'a shift count must be narrower than the type' {
+    Test-Diagnostic 'Variable a: Word = 1; Variable b: Word = a << 64;' 'too large'
+}
+Test-Case 'a shift count must not be negative' {
+    Test-Diagnostic 'Variable a: Word = 1; Variable n: Number = -1; Variable b: Word = a << n;' 'must not be negative'
+}
+Test-Case 'a shift count may be any integer type' {
+    # Deliberate exception to "both operands must be the same type": a count is
+    # not data. `Loop (i) { flags << i }` is the ordinary shape.
+    Test-Output 'Variable flags: Word = 1; Variable i: Word = 4; Terminal.Write(flags << i);' @('16')
+}
+Test-Case 'bitwise operators reject mixed widths' {
+    Test-Diagnostic 'Variable a: Word = 1; Variable b: Number = 1; Terminal.Write(a | b);' 'cannot mix'
+}
+Test-Case 'a shift binds tighter than a comparison' {
+    # C precedence: shifts tighter than relational, which is tighter than the
+    # bitwise operators. `a | b == c` must read as `a | (b == c)`.
+    $src = @'
+Variable a: Word = 4;
+Variable b: Word = 1;
+Variable five: Word = 5;
+Terminal.Write((a | b) == five);
+'@
+    Test-Output $src @('True')
+}
+Test-Case 'bitwise result keeps the operand type' {
+    # 236 has its top bit set. Reinterpreting that as signed would turn
+    # `200 | 100` into -20.
+    $src = @'
+Variable a: Character = 200;
+Variable b: Character = 100;
+Variable full: Character = 236;
+Terminal.Write((a | b) == full);
+'@
+    Test-Output $src @('True')
+}
+
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {

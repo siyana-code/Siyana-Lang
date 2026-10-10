@@ -89,7 +89,17 @@ typedef enum {
     TOKEN_LT,
     TOKEN_LT_EQ,
     TOKEN_GT,
-    TOKEN_GT_EQ
+    TOKEN_GT_EQ,
+
+    /* Bitwise. `<<` and `>>` are above the relational operators, as in C,
+     * because a shift binds tighter than a comparison and `x << 3 == y`
+     * should mean what it reads as. */
+    TOKEN_AMPERSAND,
+    TOKEN_PIPE,
+    TOKEN_CARET,
+    TOKEN_TILDE,
+    TOKEN_SHIFT_LEFT,
+    TOKEN_SHIFT_RIGHT
 } TokenType;
 
 /* A source position. Both are 1-based so diagnostics can be printed directly
