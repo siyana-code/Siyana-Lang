@@ -242,6 +242,7 @@ typedef struct {
 typedef struct {
     char *name;
     TypeKind type;         /* ignored for a payload-less union variant */
+    char *type_name;       /* owned; set when type is TYPE_NAMED */
     Position position;
     bool has_payload;      /* union variants only */
 } Field;

@@ -156,11 +156,14 @@ Clang accepted: a misplaced `static` qualifier, and a `snprintf` that could
 truncate. Both are portability bugs that would have surfaced later on other
 toolchains, which is the argument for building with both compilers.
 
-**[Unverified]** Memory leaks. AddressSanitizer is not available in this MinGW
-installation (`libclang_rt.asan` is missing), so the leak check that should
-accompany this phase has not been run. It should be enabled when a toolchain
-with a sanitizer runtime is available, or on a POSIX host where ASan ships with
-the compiler.
+**[Verified]** Memory leaks are now checked on every build, without a sanitizer.
+AddressSanitizer is not available in this MinGW installation
+(`libclang_rt.asan` is missing), so `tools/leakcheck.ps1` measures allocation
+directly instead: it links the interpreter through ld's `--wrap=malloc` and
+reports how much live heap a loop iteration adds. It replaced this unverified
+note and the Phase 3 known defect with a measurement. A toolchain with a real
+sanitizer would still be worth having, and would additionally catch use-after-free
+and overflow, which a counter cannot.
 
 ### Phase 3 — Semantic core (L) — IN PROGRESS
 
@@ -225,30 +228,43 @@ decision 26, `String` in decision 27. What is left:
    24), and a sub-range of an array is blocked on the same thing.
 3. `enum`, `SizeOf`, `For`, compound assignment — convenience, not blocking.
 
-**[Known defect]** Every struct and union value leaks its `fields` array, and
-every array value leaks its `elements`. `free_aggregate_fields` is reached
-only from the error paths inside `evaluate_struct_init` and `evaluate_union_init`;
-nothing on the success path frees, and `scope_destroy` releases the name but not
-the value. A program that builds a struct in a loop grows memory without bound.
+**[Resolved]** The struct and array leak is fixed and measured. This entry is
+kept because how it was *fixed* is the part worth remembering.
 
-Recorded rather than fixed because the fix needs a decision, not a patch: a
-`Value` holding a struct or an array must be deep-copied when copied (decisions
-21 and 26) *and* deep-freed when dropped, which puts that responsibility at
-every `Value` copy site. Half of it — the copy half — is already done via
-`value_copy`. The free half is not.
+Every value `evaluate()` produces is now owned by its caller, and
+`value_free` is the single recursive exit for it: a scope entry releases on
+`scope_destroy`, a replaced value releases on assignment, and a discarded
+expression releases in the statement loop. Reading a variable copies rather than
+aliasing, which is what makes the rule hold — without that, every release site
+would be either a double free or a leak depending on which it turned out to be.
 
-Strings are not in this list any more. Decision 27 moved them to an arena with
-a single owner and freed at exit, which was possible precisely because they had
-no borrow — a string literal pointed into the AST and `ReadLine` pointed into a
-buffer it did not own. Making that uniform was the whole fix.
+Three separate defects were behind the single symptom:
 
-Survivable while the interpreter is a bootstrap tool that will itself be
-replaced; not survivable in the language. Compounding it, the Phase 2 note
-above still stands: no sanitizer runtime is available on this toolchain, so
-this is reasoned from reading the code rather than measured. It should be fixed
-before buffers or pointers land, because that is the point at which ownership
-stops being an implementation detail and becomes something the language
-promises.
+- `scope_destroy` freed the name but not the value.
+- `copy_aggregate` copied a struct's fields *flat*, so a struct containing a
+  struct shared its inner struct's storage. A deep free is impossible over
+  shared storage, which is why the free half could never be finished.
+- `Variable b: P = a` copied an already-owned initialiser and dropped the
+  original, leaking one block per declaration — the largest remaining leak, and
+  invisible until there was a way to count.
+
+**How it is verified.** `tools/leakcheck.ps1` links the interpreter through GNU
+ld's `--wrap=malloc`, so every allocation passes through a counter in
+`tools/leakcheck.c` with no change to the interpreter's source. It runs a
+program whose only difference between two runs is the iteration count of a loop
+that builds a value, and reports the difference: any non-zero per-iteration
+growth is a leak. All sixteen cases report zero. `tools/build.ps1` runs it on
+every build and fails on a non-zero result, so this cannot regress silently.
+
+That exists because this toolchain has no AddressSanitizer. The defect had been
+recorded as "reasoned from reading the code rather than measured" — a weaker
+claim than the rest of the project makes, and the reason it sat unfixed for as
+long as it did. A leak you cannot measure is a leak you cannot verify fixed.
+
+Fixing it also surfaced a **separate bug**: `Field` never recorded the name a
+field was declared with, so `Struct Outer { inner: Inner }` was refused no matter
+what value was supplied — a struct could not contain another struct at all. Fixed
+here, since the same ownership work had to touch every field copy site anyway.
 
 ### Phase 4 — Freestanding subset (M)
 
