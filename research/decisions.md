@@ -462,19 +462,96 @@ programs must not depend on it. Anything written to a file or a wire protocol
 goes through a `Struct`, whose layout *is* specified. See
 [design/tagged-unions-and-errors.md](design/tagged-unions-and-errors.md).
 
+## 23. Error handling syntax, and the one deliberate divergence from Zig
+
+**Decision.** Errors are values with per-function declared sets. `Try` is a
+postfix operator that propagates; `Catch` handles locally and is
+**exhaustiveness-checked**; `Fail` originates an error.
+
+```
+Error Io { NotFound, Denied, }
+
+Function Open(path: String) -> Result{FileHandle, Io} { ... }
+
+Function Read(path: String) -> Result{Number, Io} {
+    Variable handle = Open(path) Try;          // propagate
+    Return handle.Size();
+}
+
+Variable size = Open(path) Catch {
+    NotFound { Terminal.Write("missing"); 0; }
+    Denied {
+        Terminal.Write("denied");
+        0;
+    }
+};
+```
+
+Full reasoning and the rejected alternatives:
+[design/error-syntax.md](design/error-syntax.md).
+
+**The divergence, stated plainly.** Zig does not enforce exhaustiveness of an
+error handler. Its idiom is `x catch |err| switch (err) { ... else => ... }`,
+and `else` matches any variant added later. Nothing breaks when someone adds
+`error.TimedOut`; the new failure is silently routed into a fallback written
+for a different one.
+
+Siyana rejects this. The language already requires `Match` to be exhaustive
+(decision 22) on the same reasoning — a type that looks safe while it is not is
+worse than no type — and an error handler is a `Match` with extra steps. For a
+language that will write to disks and hardware registers, a silently swallowed
+error is a corrupt filesystem rather than a wrong HTTP status.
+
+**`Try` is postfix only.** Zig defines `try x` as sugar for
+`x catch |err| return err`. Since Siyana has `Catch`, that is the whole
+mechanism, so `Try` is spelled once: `expr Try`. It composes — it can end a
+`Return`, sit under a `Catch`, or initialise a variable. The prefix spelling
+`Try(expr)` was rejected as a second way to say the same thing.
+
+**`Fail Variant;` exists because nothing else can start an error.** `Try` only
+propagates. Without a way to originate one, no leaf function could ever fail and
+the entire mechanism would be untestable. The variant is written bare rather
+than `Io.NotFound` because the enclosing signature already names the set, and
+there is only one.
+
+**`Result{T, E}` may only be a function return type.** A variable of that type
+would let a fallible call be bound and dealt with two lines later, and rule 1
+below would become an approximation. This is stricter than Zig and is recorded
+as a real cost.
+
+### Rules
+
+1. A call declared `-> Result{T, E}` must be immediately followed by `Try` or
+   `Catch`. A bare call is an error naming the function.
+2. `Try` is legal only if the enclosing function declares an error set covering
+   every variant of the callee's. The diagnostic names what is missing.
+3. A `Result` function may `Return` a value of `T`; errors leave only via `Try`
+   or `Fail`.
+4. A function declaring no error set may not `Try` or `Fail`.
+5. A `Catch` must handle every variant the callee can return.
+
+Rule 2 is what makes "the error type is in the signature" — the property that
+made error unions preferable to out-parameters — actually true rather than
+aspirational.
+
 ## Open decisions
 
 Not yet made:
 
-1. Compile-time evaluation: design and how much to expose. **Blocks Phase 3.**
+1. Compile-time evaluation: design and how much to expose.
 2. Closures versus first-class function pointers.
 3. Module system: file-based, package-based, or both. **Blocks Phase 4.**
-4. Do error payloads exist? See decision 15.
+4. Do error payloads exist? Settled **no** for Phase 3 — see decision 23. A
+   payload gives every variant its own type, and the syntax being added was
+   already the risky part. The binding slot `NotFound(code)` is in the grammar
+   so adding them later is additive rather than a redesign.
 5. Automatic versus explicit arena deinit. See decision 14.
 6. Pointers and borrows. Decision 21 makes structs values; a `Word` serves as
    an integer but nothing yet means "a reference to a struct." Blocked on 1 and
    on the allocator model, since a pointer without an owner invites the leaks
    decision 14 exists to prevent.
+7. May a variable hold a `Result{T, E}`? Currently no, deliberately. See
+   decision 23.
 
 **[Note]** The two decisions that blocked Phase 3 are now made (14 and 15).
 Compile-time evaluation remains, and is the next item to settle before the

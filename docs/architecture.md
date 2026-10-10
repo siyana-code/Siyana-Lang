@@ -173,7 +173,7 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
 **Exit criteria**
 
 - A tagged union with a payload compiles and runs. — **met**
-- An error propagates from a deep call stack with its context intact.
+- An error propagates from a deep call stack with its context intact. — **met**
 - An allocation failure is surfaced as a value, never a crash.
 - A test suite exists that is expressive enough to write the OS in. — **partly**
 
@@ -184,19 +184,17 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
   (decision 21).
 - `Union` declarations with payload-less and payload-carrying variants, and
   `Match` with exhaustiveness checking (decision 22).
-- `Error Name { ... }` declared as a payload-less union. `Try`/`Catch` are not
-  yet implemented.
-- Named types usable in `Variable x: Foo` and parameter positions, resolved at
-  run time so a declaration may follow its use.
+- Error sets, `Result{T, E}` return types, `Try`, `Catch`, and `Fail`, with
+  per-function error sets and two enforced rules (decision 23).
 
 **Remaining, in the order the design forces**
 
-1. Compile-time evaluation — still undecided, and it is the last Phase 3
-   blocker that is a *choice* rather than a build.
-2. Error propagation, `Try`/`Catch`, and `Result{T, E}`.
-3. The allocator block form. Ordered after 2 deliberately: an error
-   propagating out of an `allocator(x) { }` block must restore the binding, so
-   building the block first would mean building unwinding twice.
+1. Compile-time evaluation — still undecided, and it is the last Phase 3 item
+   that is a *choice* rather than a build.
+2. The allocator block form, which needs errors to unwind past — they now
+   exist, so this is unblocked. `allocator(x) { }` binds on entry and restores
+   on exit, including on the propagating path.
+3. Pointers, once the allocator model is in place.
 
 **[Known defect]** Every struct and union value leaks its `fields` array.
 `free_aggregate_fields` is reached only from the error paths inside
@@ -410,15 +408,14 @@ argument:
   the harness was confirmed to fail against a deliberately broken restore.
 - **Error handling: error unions with declared error sets** (decision 15).
 
-Three decisions have been added since: structs are values (21), and `Match` is
-an exhaustiveness-checked statement whose unions have no guaranteed byte
-layout (22).
+Three decisions have been added since: structs are values (21), `Match` is an
+exhaustiveness-checked statement whose unions have no guaranteed byte layout
+(22), and the error syntax with its one deliberate divergence from Zig (23).
 
 Next: settle compile-time evaluation — the last Phase 3 item that is a *choice*
-rather than a build. After that the remaining order is forced: error
-propagation first, then the allocator block form. An error must be able to
-unwind past an allocator block, so errors have to exist before the block form
-does.
+rather than a build. After that the order is forced: the allocator block form,
+because an error must be able to unwind past it and that mechanism now exists
+but has nothing to unwind past yet.
 
 **Still outstanding:** decision 12 (braces and semicolons) was explicitly
 deferred as a "before Phase 3" item. The cost of switching grows with every

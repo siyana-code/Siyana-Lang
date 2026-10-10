@@ -596,6 +596,168 @@ Test-Case 'Error declares a payload-less union' {
     Test-Output 'Error Io { NotFound, Denied, } Terminal.Write("declared");' @('declared')
 }
 
+# --- Errors ----------------------------------------------------------------
+#
+# Two rules carry the weight here. A call that can fail must be handled at the
+# point of the call (rule 1), and a Try may only propagate an error the calling
+# function has declared it can carry (rule 2). Everything else is syntax.
+
+Test-Case 'a Catch runs the arm for the error that happened' {
+    $src = @'
+Error Io { NotFound, Denied, }
+Function F(which: Number) -> Result{Number, Io} {
+    If (which == 1) { Return 100; }
+    Fail Denied;
+}
+Function G(which: Number) {
+    Variable n: Number = F(which) Catch {
+        NotFound { -1; }
+        Denied { -2; }
+    };
+    Terminal.Write(n);
+}
+G(1);
+G(2);
+'@
+    Test-Output $src @('100', '-2')
+}
+Test-Case 'a Catch on the success path yields the value' {
+    Test-Output 'Error E { X, } Function F() -> Result{Number, E} { Return 7; } Function G() { Variable n: Number = F() Catch { X { 0; } }; Terminal.Write(n); } G();' @('7')
+}
+Test-Case 'Try forwards an error up the call stack' {
+    $src = @'
+Error E { X, }
+Function Leaf() -> Result{Number, E} { Fail X; }
+Function Middle() -> Result{Number, E} {
+    Variable n: Number = Leaf() Try;
+    Return n + 1;
+}
+Function Top() {
+    Variable v: Number = Middle() Catch { X { 42; } };
+    Terminal.Write(v);
+}
+Top();
+'@
+    Test-Output $src @('42')
+}
+Test-Case 'Try is transparent on the success path' {
+    Test-Output 'Error E { X, } Function F() -> Result{Number, E} { Return 5; } Function G() -> Result{Number, E} { Variable n: Number = F() Try; Return n; } Function H() { Variable v: Number = G() Catch { X { 0; } }; Terminal.Write(v); } H();' @('5')
+}
+Test-Case 'Try composes with Return' {
+    Test-Output 'Error E { X, } Function F() -> Result{Number, E} { Fail X; } Function G() -> Result{Number, E} { Return F() Try; } Function H() { Variable v: Number = G() Catch { X { 9; } }; Terminal.Write(v); } H();' @('9')
+}
+Test-Case 'an unhandled fallible call is an error' {
+    # Rule 1. The point of the whole design: a Result never reaches a place
+    # that does not handle it.
+    Test-Diagnostic 'Error E { X, } Function F() -> Result{Number, E} { Return 1; } Variable n: Number = F();' 'can fail; follow the call with Try or Catch'
+}
+Test-Case 'a Catch must handle every variant' {
+    Test-Diagnostic 'Error E { A, B, } Function F() -> Result{Number, E} { Fail A; } Variable n: Number = F() Catch { A { 1; } };' "does not handle 'B'"
+}
+Test-Case 'a Catch may not name an error the callee cannot raise' {
+    Test-Diagnostic 'Error E { A, } Function F() -> Result{Number, E} { Return 1; } Variable n: Number = F() Catch { Z { 1; } };' "cannot fail with 'Z'"
+}
+Test-Case 'a Catch may not handle the same error twice' {
+    Test-Diagnostic 'Error E { A, } Function F() -> Result{Number, E} { Fail A; } Variable n: Number = F() Catch { A { 1; } A { 2; } };' "handled twice"
+}
+Test-Case 'Try cannot propagate an error the caller does not declare' {
+    # Rule 2, and the reason it exists: without it, an error could leave a
+    # function whose signature cannot describe it. G must be called -- the rule
+    # is checked when the Try runs, like every other rule in the interpreter.
+    $src = @'
+Error A { X, }
+Error B { Y, }
+Function F() -> Result{Number, B} { Fail Y; }
+Function G() -> Result{Number, A} {
+    Variable n: Number = F() Try;
+    Return n;
+}
+Function H() { Variable v: Number = G() Catch { X { 0; } }; }
+H();
+'@
+    Test-Diagnostic $src "can fail with 'Y'"
+}
+Test-Case 'a superset error set may propagate a subset' {
+    # A declares both X and Y; F can only raise X. G may forward X.
+    $src = @'
+Error A { X, Y, }
+Error B { X, }
+Function F() -> Result{Number, B} { Fail X; }
+Function G() -> Result{Number, A} {
+    Variable n: Number = F() Try;
+    Return n;
+}
+Function H() {
+    Variable v: Number = G() Catch { X { 3; } Y { 4; } };
+    Terminal.Write(v);
+}
+H();
+'@
+    Test-Output $src @('3')
+}
+Test-Case 'Try at the top level has nowhere to propagate to' {
+    Test-Diagnostic 'Error E { X, } Function F() -> Result{Number, E} { Fail X; } Variable n: Number = F() Try;' 'no enclosing function'
+}
+Test-Case 'a Catch at the top level is fine' {
+    # The caller of a Catch does not need to be a function; only a Try does,
+    # because a Try has to hand the error to somebody.
+    Test-Output 'Error E { X, } Function F() -> Result{Number, E} { Fail X; } Variable n: Number = F() Catch { X { 4; } }; Terminal.Write(n);' @('4')
+}
+Test-Case 'Fail needs a declared error set' {
+    Test-Diagnostic 'Error E { X, } Function F() { Fail X; } F();' 'declares no error set'
+}
+Test-Case 'Fail cannot name an error the function does not declare' {
+    $src = @'
+Error E { X, }
+Function F() -> Result{Number, E} { Fail Other; }
+Function G() { Variable v: Number = F() Catch { X { 0; } }; }
+G();
+'@
+    Test-Diagnostic $src "cannot fail with 'Other'"
+}
+Test-Case 'Result is only a function return type' {
+    # A variable of that type would let a fallible call be bound and forgotten,
+    # which is exactly what rule 1 exists to prevent.
+    Test-Diagnostic 'Error E { X, } Variable v: Result{Number, E} = 1;' 'may only be a function return type'
+}
+Test-Case 'a Catch arm must end with an expression' {
+    Test-Diagnostic 'Error E { X, } Function F() -> Result{Number, E} { Fail X; } Variable n: Number = F() Catch { X { } };' 'must end with an expression'
+}
+Test-Case 'Try on something that cannot fail is an error' {
+    $src = @'
+Error E { X, }
+Function F() { Return 1; }
+Function G() -> Result{Number, E} {
+    Variable n: Number = F() Try;
+    Return n;
+}
+Function H() { Variable v: Number = G() Catch { X { 0; } }; }
+H();
+'@
+    Test-Diagnostic $src 'cannot fail'
+}
+Test-Case 'an error stops the statements after it' {
+    # Statements before the Try must run and statements after it must not,
+    # including ones nested in an If. The guard has to cover nested blocks, not
+    # just the loop directly containing the propagating statement.
+    $src = @'
+Error E { X, }
+Function F() -> Result{Number, E} { Fail X; }
+Function G() -> Result{Number, E} {
+    Terminal.Write("one");
+    Variable v: Number = 0;
+    If (1) { Terminal.Write("two"); }
+    Variable v2: Number = F() Try;
+    Terminal.Write("three");
+    If (1) { Terminal.Write("four"); }
+    Return 1;
+}
+Function H() { Variable z: Number = G() Catch { X { 0; } }; }
+H();
+'@
+    Test-Output $src @('one', 'two')
+}
+
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {

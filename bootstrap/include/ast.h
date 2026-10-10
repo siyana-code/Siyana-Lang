@@ -25,6 +25,7 @@ typedef enum {
     STMT_STRUCT,
     STMT_UNION,
     STMT_MATCH,
+    STMT_FAIL,
 
     /* Expressions */
     EXPR_NUMBER,
@@ -39,7 +40,9 @@ typedef enum {
     EXPR_BUILTIN,
     EXPR_STRUCT_INIT,
     EXPR_FIELD,
-    EXPR_UNION_INIT
+    EXPR_UNION_INIT,
+    EXPR_TRY,
+    EXPR_CATCH
 } NodeType;
 
 /* What a type declaration defines. An Error is a union whose variants carry no
@@ -85,7 +88,12 @@ typedef enum {
     /* A Struct or Union name. Resolved at run time rather than parse time,
      * because a declaration may legally appear after its use. The name is
      * carried alongside the declaration. */
-    TYPE_NAMED
+    TYPE_NAMED,
+
+    /* `Result{T, E}` -- a success type paired with an error set. Only valid as
+     * a function return type; a variable of this type is deliberately not
+     * expressible, so a fallible call cannot be bound and forgotten. */
+    TYPE_RESULT
 } TypeKind;
 
 const char *type_kind_name(TypeKind type);
@@ -100,6 +108,21 @@ bool type_kind_is_unsigned(TypeKind type);
 
 typedef struct Expr Expr;
 typedef struct Stmt Stmt;
+
+/* One arm of a Match, or of a Catch. A variant name, the name to bind its
+ * payload to (NULL if the arm does not use it), and the statements to run.
+ *
+ * Shared deliberately: exhaustiveness is checked the same way for a union and
+ * for an error set, and one shared grammar is what keeps it one rule rather
+ * than two that drift apart. Declared before Expr because Expr holds an array
+ * of them for EXPR_CATCH. */
+typedef struct {
+    char *variant;         /* owned */
+    char *binding;         /* owned, may be NULL */
+    Position position;
+    Stmt **body;
+    size_t body_count;
+} MatchArm;
 
 /* A node carries both statement and expression fields because the union is
  * shared: STMT_EXPR and STMT_RETURN hold an Expr, and EXPR_CALL holds a Stmt*.
@@ -144,6 +167,18 @@ typedef struct Expr {
      * value, or NULL for a payload-less variant. */
     char *variant;         /* owned */
     Expr *payload;
+
+    /* EXPR_TRY and EXPR_CATCH use `left` for the fallible expression. */
+
+    /* EXPR_CATCH: arms over the callee's error set, parsed exactly like Match
+     * arms so there is one grammar for exhaustiveness rather than two. */
+    MatchArm *arms;        /* owned */
+    size_t arm_count;
+
+    /* Set by the parser when this call is the direct operand of Try or Catch.
+     * The parser is the only place that can see this relationship, and rule 1
+     * -- an unhandled fallible call is an error -- needs it. */
+    bool handled;
 } Expr;
 
 /* A local variable or a function parameter. */
@@ -161,16 +196,6 @@ typedef struct {
     Position position;
     bool has_payload;      /* union variants only */
 } Field;
-
-/* One arm of a Match: a variant name, the name to bind its payload to (NULL
- * if the arm does not use it), and the statements to run. */
-typedef struct {
-    char *variant;         /* owned */
-    char *binding;         /* owned, may be NULL */
-    Position position;
-    Stmt **body;
-    size_t body_count;
-} MatchArm;
 
 struct Stmt {
     NodeType type;
@@ -212,6 +237,13 @@ struct Stmt {
     Parameter *parameters;  /* owned array */
     size_t parameter_count;
     bool declares_return;
+
+    /* STMT_FUNCTION, when `declared_type` is TYPE_RESULT: the success type and
+     * the error set's name. Every error leaving this function passes through
+     * this declaration, which is what makes rule 2 checkable. */
+    TypeKind result_ok_type;
+    char *result_ok_name;  /* owned; set when the success type is named */
+    char *result_error_name; /* owned */
 
     /* STMT_STRUCT and STMT_UNION */
     DeclKind decl_kind;

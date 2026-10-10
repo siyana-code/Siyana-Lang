@@ -136,7 +136,20 @@ through a `Struct`, whose layout is specified. See
 [decision 22](research/decisions.md).
 
 Deliberately **not** implemented yet: slices, modules, pointers, string
-concatenation, error propagation, and the explicit allocator model.
+concatenation, and the explicit allocator model.
+
+**Errors are values with declared sets.** `Try` propagates, `Catch` handles,
+`Fail` originates. A call that can fail must be handled where it is written,
+and a `Try` may only propagate an error the calling function declares it can
+carry — otherwise an error could leave a function whose signature cannot
+describe it. See [decision 23](research/decisions.md).
+
+**`Catch` is exhaustiveness-checked — this departs from Zig on purpose.** Zig's
+idiom is `catch |err| switch (err) { ... else => ... }`, where `else` keeps
+compiling when a variant is added and quietly routes the new failure into a
+fallback written for a different one. For a language that will write to disks
+and hardware registers, that is a corrupt filesystem rather than a bad status
+code.
 
 Errors are reported with a source position and a caret:
 

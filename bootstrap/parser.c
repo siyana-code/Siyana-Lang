@@ -67,6 +67,12 @@ static Expr *parse_assignment(Parser *parser);
  * above them: a field or variant may be named after a type keyword. */
 static bool is_name_token(TokenType type);
 
+static bool parse_block(Parser *parser, Stmt ***body, size_t *count);
+
+/* expr_free releases Catch arms, which hold statements, so the two recurse into
+ * each other and one of them has to be declared first. */
+static void stmt_free(Stmt *stmt);
+
 static void fail(Parser *parser, Position position, const char *fmt, ...) {
     if (parser->failed) return;
     parser->failed = true;
@@ -158,13 +164,26 @@ static void expr_free(Expr *expr) {
     if (expr == NULL) return;
     free(expr->text);
     free(expr->name);
+    free(expr->variant);
     expr_free(expr->left);
     expr_free(expr->right);
     expr_free(expr->callee);
+    expr_free(expr->payload);
     for (size_t i = 0; i < expr->argument_count; i++) {
         expr_free(expr->arguments[i]);
     }
     free(expr->arguments);
+
+    /* EXPR_CATCH reuses the Match arm layout, so it is released the same way. */
+    for (size_t i = 0; i < expr->arm_count; i++) {
+        free(expr->arms[i].variant);
+        free(expr->arms[i].binding);
+        for (size_t j = 0; j < expr->arms[i].body_count; j++) {
+            stmt_free(expr->arms[i].body[j]);
+        }
+        free(expr->arms[i].body);
+    }
+    free(expr->arms);
     free(expr);
 }
 
@@ -196,10 +215,16 @@ static void stmt_free(Stmt *stmt) {
     for (size_t i = 0; i < stmt->loop_count; i++) stmt_free(stmt->loop_body_statements[i]);
     free(stmt->loop_body_statements);
 
-    for (size_t i = 0; i < stmt->parameter_count; i++) free(stmt->parameters[i].name);
+    for (size_t i = 0; i < stmt->parameter_count; i++) {
+        free(stmt->parameters[i].name);
+        free(stmt->parameters[i].type_name);
+    }
     free(stmt->parameters);
 
     free(stmt->name);
+    free(stmt->type_name);
+    free(stmt->result_ok_name);
+    free(stmt->result_error_name);
     free(stmt);
 }
 
@@ -221,8 +246,19 @@ void program_free(Program *program) {
  * are also types, but they are resolved at run time rather than at parse time:
  * the parser has no symbol table, and a declaration may appear after its use.
  * A named type in a `Variable x: Foo` annotation is therefore accepted as a
- * special case below and checked when the declaration runs. */
+ * special case below and checked when the declaration runs.
+ *
+ * `Result{T, E}` is accepted here too, but only the function-return caller
+ * passes an `out_result`; every other caller rejects it, so a variable of that
+ * type cannot be written. That restriction is the point -- see
+ * research/design/error-syntax.md. */
 static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named) {
+    if (match(parser, TOKEN_RESULT)) {
+        fail(parser, current(parser)->start,
+             "'Result{T, E}' may only be a function return type");
+        return false;
+    }
+
     if (match(parser, TOKEN_NUMBER_TYPE)) {
         *out_type = TYPE_NUMBER;
         return true;
@@ -254,6 +290,46 @@ static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named) {
          "expected a type name, found %s",
          token_type_description(current(parser)->type));
     return false;
+}
+
+/* Parses `Result{T, E}` and reports the two type names separately.
+ *
+ * Called after `Result` has already been matched, so it consumes the brace but
+ * not the keyword.
+ *
+ * Only a function's return type may be a Result, so this is not part of
+ * parse_type: the surrounding rules differ (a Return may propagate an error;
+ * a Variable may not) and folding it in would need a flag threaded through
+ * every call site to say which context it is in. */
+static bool parse_result_type(Parser *parser, Stmt *stmt) {
+    Position start = current(parser)->start;
+
+    if (!consume(parser, TOKEN_LBRACE, "'{' after 'Result'")) return false;
+
+    stmt->declared_type = TYPE_RESULT;
+    if (!parse_type(parser, &stmt->result_ok_type, &stmt->result_ok_name)) return false;
+
+    if (!consume(parser, TOKEN_COMMA, "',' between the success type and the error set")) {
+        return false;
+    }
+
+    /* The error set is always a name -- a declared Error or Union. An inline
+     * `error{...}` spelling was considered and rejected: it would put a second
+     * way to write a type in a position that must resolve to one declaration. */
+    if (!check(parser, TOKEN_IDENT)) {
+        fail(parser, current(parser)->start,
+             "expected an error set name after the comma, found %s",
+             token_type_description(current(parser)->type));
+        return false;
+    }
+    stmt->result_error_name = copy_ident(advance_token(parser));
+
+    if (!consume(parser, TOKEN_RBRACE, "closing '}' of a Result type")) return false;
+    if (stmt->result_error_name == NULL) {
+        fail(parser, start, "out of memory");
+        return false;
+    }
+    return true;
 }
 
 /* --- Primary expressions -------------------------------------------------- */
@@ -400,6 +476,110 @@ static Expr *parse_primary(Parser *parser) {
  * guessing here and was wrong -- it made every `p.field` a constructor attempt.
  * Now both cases produce one node and the interpreter decides from the declared
  * types, which is the only place the answer actually exists. */
+/* Parses the arms of a `Catch`:
+ *
+ *     Catch {
+ *         NotFound { Terminal.Write("missing"); 0 }
+ *         Denied {
+ *             Terminal.Write("denied");
+ *             0
+ *         }
+ *     }
+ *
+ * An arm is a variant name, an optional payload binding, and a block -- the
+ * same shape as a Match arm, so there is one grammar for exhaustiveness rather
+ * than two. The one difference is checked by the caller: a Catch arm's block
+ * must end with an expression, and that expression's value is the arm's result.
+ *
+ * Unlike a Match arm there is no `Type.Variant`, because the error set is
+ * already known from the callee's declared return type. Naming it per arm would
+ * repeat what the surrounding expression has said once.
+ */
+static bool parse_catch_arms(Parser *parser, Expr *handle) {
+    if (!consume(parser, TOKEN_LBRACE, "'{' to open a Catch body")) return false;
+
+    size_t capacity = 4;
+    handle->arms = malloc(capacity * sizeof(MatchArm));
+    if (handle->arms == NULL) {
+        fail(parser, handle->position, "out of memory");
+        return false;
+    }
+
+    while (!check(parser, TOKEN_RBRACE)) {
+        if (check(parser, TOKEN_EOF)) {
+            fail(parser, handle->position, "unclosed '{' -- missing '}'");
+            return false;
+        }
+
+        if (!check(parser, TOKEN_IDENT)) {
+            fail(parser, current(parser)->start,
+                 "expected an error name at the start of a Catch arm, found %s",
+                 token_type_description(current(parser)->type));
+            return false;
+        }
+        const Token *variant_name = advance_token(parser);
+
+        if (handle->arm_count + 1 > capacity) {
+            capacity *= 2;
+            MatchArm *grown = realloc(handle->arms, capacity * sizeof(MatchArm));
+            if (grown == NULL) {
+                fail(parser, handle->position, "out of memory");
+                return false;
+            }
+            handle->arms = grown;
+        }
+
+        MatchArm *arm = &handle->arms[handle->arm_count];
+        memset(arm, 0, sizeof(*arm));
+        arm->position = variant_name->start;
+        arm->variant = copy_ident(variant_name);
+        if (arm->variant == NULL) {
+            fail(parser, variant_name->start, "out of memory");
+            return false;
+        }
+        handle->arm_count++;
+
+        /* The binding slot is accepted now, before error payloads exist, so
+         * adding them later does not change this grammar. */
+        if (match(parser, TOKEN_LPAREN)) {
+            if (!check(parser, TOKEN_IDENT)) {
+                fail(parser, current(parser)->start,
+                     "expected a name to bind the payload to, found %s",
+                     token_type_description(current(parser)->type));
+                return false;
+            }
+            arm->binding = copy_ident(advance_token(parser));
+            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a payload binding")) {
+                return false;
+            }
+        }
+
+        if (!parse_block(parser, &arm->body, &arm->body_count)) return false;
+
+        /* Every arm must produce a value, because the Catch as a whole stands in
+         * for the success value. An arm that cannot is a bug, and finding it at
+         * the arm rather than at the use makes the message point somewhere
+         * useful. */
+        if (arm->body_count == 0 || arm->body[arm->body_count - 1]->type != STMT_EXPR) {
+            fail(parser, arm->position,
+                 "Catch arm '%s' must end with an expression giving the value to use",
+                 arm->variant);
+            return false;
+        }
+
+        /* A comma between arms is optional; each arm ends with its own block. */
+        match(parser, TOKEN_COMMA);
+    }
+
+    if (!consume(parser, TOKEN_RBRACE, "closing '}' of a Catch body")) return false;
+
+    if (handle->arm_count == 0) {
+        fail(parser, handle->position, "Catch must have at least one arm");
+        return false;
+    }
+    return true;
+}
+
 static Expr *parse_postfix(Parser *parser, Expr *base) {
     if (parser->failed || base == NULL) return NULL;
 
@@ -535,6 +715,45 @@ static Expr *parse_postfix(Parser *parser, Expr *base) {
         }
 
         return parse_postfix(parser, literal);
+    }
+
+    /* `expr Try` -- propagate the error from the enclosing function.
+     *
+     * Postfix rather than a `Try(expr)` prefix so there is exactly one spelling
+     * of the operator, and so it composes: it can end a Return, sit under a
+     * Catch, or initialise a variable. */
+    if (match(parser, TOKEN_TRY)) {
+        Expr *propagate = expr_new(parser, EXPR_TRY, current(parser)->start);
+        if (propagate == NULL) {
+            expr_free(base);
+            return NULL;
+        }
+        propagate->position = base->position;
+        propagate->left = base;
+
+        /* Rule 1: a fallible call is handled here, so record that on the call
+         * itself. The parser is the only place this relationship is visible. */
+        if (base->type == EXPR_CALL) base->handled = true;
+
+        return parse_postfix(parser, propagate);
+    }
+
+    /* `expr Catch { Variant { ... } ... }` -- handle the error locally. */
+    if (match(parser, TOKEN_CATCH)) {
+        Expr *handle = expr_new(parser, EXPR_CATCH, current(parser)->start);
+        if (handle == NULL) {
+            expr_free(base);
+            return NULL;
+        }
+        handle->position = base->position;
+        handle->left = base;
+        if (base->type == EXPR_CALL) base->handled = true;
+
+        if (!parse_catch_arms(parser, handle)) {
+            expr_free(handle);
+            return NULL;
+        }
+        return parse_postfix(parser, handle);
     }
 
     return base;
@@ -927,6 +1146,13 @@ static Stmt *parse_function_declaration(Parser *parser) {
             }
             const Token *parameter_name = advance_token(parser);
             Parameter *parameter = &stmt->parameters[stmt->parameter_count++];
+            /* Zeroed because the array comes from malloc, not calloc, and
+             * parse_type only writes type_name on the named-type path. Left
+             * uninitialised, a primitive parameter such as `n: Number` holds
+             * whatever was on the heap, and stmt_free later frees that. It
+             * reads as harmless because the field is only read on one path --
+             * the free does not know which. */
+            memset(parameter, 0, sizeof(*parameter));
             parameter->name = copy_ident(parameter_name);
             parameter->position = parameter_name->start;
 
@@ -951,7 +1177,12 @@ static Stmt *parse_function_declaration(Parser *parser) {
             stmt_free(stmt);
             return NULL;
         }
-        if (!parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
+        if (match(parser, TOKEN_RESULT)) {
+            if (!parse_result_type(parser, stmt)) {
+                stmt_free(stmt);
+                return NULL;
+            }
+        } else if (!parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
             stmt_free(stmt);
             return NULL;
         }
@@ -1181,6 +1412,44 @@ static Stmt *parse_aggregate(Parser *parser, DeclKind kind, TokenType keyword) {
  * The type name is repeated on every arm rather than inferred from a leading
  * `Match v {`, which keeps each arm self-describing and makes the exhaustiveness
  * check a simple comparison against the declaration. */
+/* `Fail Variant;` -- raise one error from the enclosing function.
+ *
+ * The variant name is written bare, not `Io.NotFound`, because the enclosing
+ * function's signature already names the error set and there is only one. The
+ * set is fixed by `-> Result{T, Io}` above the body, so repeating it on every
+ * Fail would say nothing the reader does not already have.
+ *
+ * This is what lets a leaf function fail at all. Try only propagates, so
+ * without a way to originate an error no function could ever return one and the
+ * whole mechanism would be untestable.
+ */
+static Stmt *parse_fail(Parser *parser) {
+    Position start = current(parser)->start;
+    advance_token(parser); /* 'Fail' */
+
+    if (!check(parser, TOKEN_IDENT)) {
+        fail(parser, current(parser)->start,
+             "expected an error name after 'Fail', found %s",
+             token_type_description(current(parser)->type));
+        return NULL;
+    }
+
+    Stmt *stmt = stmt_new(parser, STMT_FAIL, start);
+    if (stmt == NULL) return NULL;
+    stmt->name = copy_ident(advance_token(parser));
+    if (stmt->name == NULL) {
+        fail(parser, start, "out of memory");
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    if (!consume(parser, TOKEN_SEMICOLON, "';' after a Fail")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+    return stmt;
+}
+
 static Stmt *parse_match(Parser *parser) {
     Position start = current(parser)->start;
     advance_token(parser); /* Match */
@@ -1326,6 +1595,7 @@ static Stmt *parse_statement(Parser *parser) {
          * way so a variant list reads identically. */
         case TOKEN_ERROR:      return parse_aggregate(parser, DECL_UNION, TOKEN_ERROR);
         case TOKEN_MATCH:      return parse_match(parser);
+        case TOKEN_FAIL:      return parse_fail(parser);
         case TOKEN_IF:    return parse_if(parser);
     case TOKEN_LOOP:   return parse_loop(parser);
         case TOKEN_RETURN: {

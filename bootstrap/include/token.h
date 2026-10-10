@@ -56,6 +56,13 @@ typedef enum {
     /* Match */
     TOKEN_MATCH,
 
+    /* Errors. `Try` and `Catch` are postfix operators on an expression:
+     * `Open(path) Try` propagates, `Open(path) Catch { ... }` handles. */
+    TOKEN_RESULT,
+    TOKEN_TRY,
+    TOKEN_CATCH,
+    TOKEN_FAIL,
+
     /* Punctuation */
     TOKEN_LPAREN,
     TOKEN_RPAREN,
