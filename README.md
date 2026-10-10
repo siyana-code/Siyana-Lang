@@ -98,10 +98,16 @@ Loop (i < 3) {
     Terminal.Write(i);
     i = i + 1;
 }
+
+// Fixed-size arrays. Value semantics, like structs: assignment copies.
+Variable page: [3]Word = [10, 20, 30];
+page[0] = 42;
+Terminal.Write(page[0]);        // 42
+Terminal.Write(page.Length());   // 3
 ```
 
-Operators: `+ - * /`, `== != < <= > >=`, unary `-` and `!`. Builtins:
-`Terminal.Write`, `Terminal.ReadLine`.
+Operators: `+ - * /`, `== != < <= > >=`, `& | ^ ~ << >>`, unary `-` and `!`.
+Builtins: `Terminal.Write`, `Terminal.ReadLine`.
 
 **Overflow is an error, never a wrap.**
 
@@ -141,8 +147,15 @@ all ones. A left shift that carries bits out of the type is an error, not a
 truncation, because a dropped flag bit is a security bug that compiles. See
 [decision 25](research/decisions.md).
 
-Deliberately **not** implemented yet: arrays, a `String` type, buffers, borrows,
-slices, modules, and pointers.
+**Arrays are fixed-size and are values.** `[N]T` for a variable or a parameter;
+`[a, b, c]` for a literal, which must match the declared length. Indexes are
+range-checked on every read and write, so an index that runs off the end is an
+error naming the index and the length rather than a silent read of whatever is
+next in memory. Assignment copies the elements, like a struct — there is no
+aliasing to reason about. See [decision 26](research/decisions.md).
+
+Deliberately **not** implemented yet: a `String` type, buffers, borrows, slices,
+modules, and pointers.
 
 **Allocation is explicit and failure is a value.** An `Allocator` owns a region;
 `Allocate` returns an offset into it and `OutOfMemory` is a normal error to

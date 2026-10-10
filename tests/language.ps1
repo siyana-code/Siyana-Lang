@@ -1021,6 +1021,190 @@ Terminal.Write((a | b) == full);
     Test-Output $src @('True')
 }
 
+# --- Arrays -----------------------------------------------------------------
+
+Test-Case 'an array element can be read' {
+    $src = @'
+Variable page: [4]Word = [10, 20, 30, 40];
+Terminal.Write(page[2]);
+'@
+    Test-Output $src @('30')
+}
+Test-Case 'an array element can be assigned' {
+    $src = @'
+Variable page: [4]Word = [10, 20, 30, 40];
+page[2] = 99;
+Terminal.Write(page[2]);
+'@
+    Test-Output $src @('99')
+}
+Test-Case 'Length reports the declared length' {
+    # The length comes from the type, so it is available before any literal is.
+    Test-Output "Variable page: [512]Word;`nTerminal.Write(page.Length());" @('512')
+}
+Test-Case 'an array prints its contents' {
+    # Printing an array shows what is in it, so a wrong value is visible rather
+    # than hidden behind a summary.
+    Test-Output "Variable page: [3]Word = [10, 20, 30];`nTerminal.Write(page);" @('[10, 20, 30]')
+}
+Test-Case 'an uninitialised element prints as nothing' {
+    # An array declared without a literal starts with every element unchosen.
+    # Printing zeroed fields instead would claim the programmer had set them.
+    Test-Output "Variable page: [2]Word;`nTerminal.Write(page);" @('[nothing, nothing]')
+}
+Test-Case 'an array literal must match the declared length' {
+    $src = @'
+Variable page: [3]Word = [10, 20];
+Terminal.Write(1);
+'@
+    Test-Diagnostic $src 'this array has 3 element\(s\) but 2 were given'
+}
+Test-Case 'reading past the end is an error, not a wrap' {
+    # An index that runs off the end is a memory-safety bug. This language has
+    # no pointer arithmetic for a programmer to have got wrong, so a silent read
+    # would have to be a bug in the interpreter itself.
+    $src = @'
+Variable page: [3]Word = [10, 20, 30];
+Terminal.Write(page[3]);
+'@
+    Test-Diagnostic $src 'index 3 is outside this array of 3 element\(s\)'
+}
+Test-Case 'a negative index is an error' {
+    # Not clamped to zero and not read from before the array.
+    Test-Diagnostic "Variable page: [3]Word = [10, 20, 30];`nTerminal.Write(page[-1]);" 'must not be negative'
+}
+Test-Case 'a Word index past the end is an error' {
+    # The index is a Word, so there is no negative case -- only the upper bound.
+    $src = @'
+Variable page: [3]Word = [10, 20, 30];
+Variable at: Word = 3;
+Terminal.Write(page[at]);
+'@
+    Test-Diagnostic $src 'index 3 is outside'
+}
+Test-Case 'an array copies on assignment' {
+    # Value semantics, like a struct. Two names never share storage.
+    $src = @'
+Variable page: [3]Word = [10, 20, 30];
+Variable copy: [3]Word = page;
+copy[0] = 99;
+Terminal.Write(page[0]);
+Terminal.Write(copy[0]);
+'@
+    Test-Output $src @('10', '99')
+}
+Test-Case 'an array passes to a function by value' {
+    # The callee mutates its copy; the caller's array is untouched.
+    $src = @'
+Function Zero(first: [3]Word) {
+    first[0] = 0;
+}
+Variable page: [3]Word = [10, 20, 30];
+Zero(page);
+Terminal.Write(page[0]);
+'@
+    Test-Output $src @('10')
+}
+Test-Case 'an array literal may be a call argument' {
+    # The literal's shape comes from the parameter, the only place it is written.
+    $src = @'
+Function Sum(table: [3]Word) -> Number {
+    Return table[0] + table[1] + table[2];
+}
+Terminal.Write(Sum([1, 2, 3]));
+'@
+    Test-Output $src @('6')
+}
+Test-Case 'an array of the wrong length is refused' {
+    $src = @'
+Function Sum(table: [3]Word) -> Number {
+    Return table[0];
+}
+Variable page: [4]Word = [1, 2, 3, 4];
+Terminal.Write(Sum(page));
+'@
+    Test-Diagnostic $src "expects an array of 3, got 4"
+}
+Test-Case 'array elements are checked against the element type' {
+    # The element type is not decoration: a Number literal narrows to a Word,
+    # but a Number array is not a Word array.
+    $src = @'
+Variable names: [2]Number = [10, 20];
+Variable page: [2]Word = names;
+'@
+    Test-Diagnostic $src 'this array holds Number but 2 Word were given'
+}
+Test-Case 'an array of Characters holds bytes' {
+    # A Character is a byte, so an array of them is a byte buffer -- the shape a
+    # file path or a command line needs. Each prints as its character.
+    $src = @'
+Variable name: [5]Character = [104, 101, 108, 108, 111];
+Variable i: Word = 0;
+Loop i < name.Length() {
+    Terminal.Write(name[i]);
+    i = i + 1;
+}
+'@
+    Test-Output $src @('h', 'e', 'l', 'l', 'o')
+}
+Test-Case 'an array of structs nests by value' {
+    # The element type may be a struct, and the element is copied out -- so
+    # `last` is independent of what is still in the array.
+    $src = @'
+Struct Point { x: Number, y: Number }
+Variable path: [3]Point = [Point{x: 0, y: 0}, Point{x: 1, y: 1}, Point{x: 2, y: 4}];
+Variable last: Point = path[2];
+last.x = 99;
+Terminal.Write(last.x);
+Terminal.Write(path[2].x);
+'@
+    Test-Output $src @('99', '2')
+}
+Test-Case 'an array literal may hold struct literals' {
+    $src = @'
+Struct Point { x: Number, y: Number }
+Variable path: [2]Point = [Point{x: 1, y: 2}, Point{x: 3, y: 4}];
+Terminal.Write(path[1].y);
+'@
+    Test-Output $src @('4')
+}
+Test-Case 'an array element must match the element type' {
+    $src = @'
+Variable page: [2]Word = [10, "seventy"];
+'@
+    Test-Diagnostic $src 'an array element expects Word, got String'
+}
+Test-Case 'an array length must be a number' {
+    Test-Diagnostic 'Variable page: []Word;' 'an array length must be a number'
+}
+Test-Case 'an array length must be greater than zero' {
+    Test-Diagnostic 'Variable page: [0]Word;' 'greater than zero'
+}
+Test-Case 'indexing a Number is an error' {
+    Test-Diagnostic 'Variable n: Number = 5; Terminal.Write(n[0]);' 'cannot index Number'
+}
+Test-Case 'indexing a String is an error' {
+    # Strings are not arrays of bytes yet. This is a gap, not a ruling -- but
+    # saying so here means the test will change when it is filled.
+    Test-Diagnostic 'Terminal.Write("abc"[0]);' 'cannot index String'
+}
+Test-Case 'a nested index is refused' {
+    # Only a whole variable is a target. `a[0][1] = x` would need a path this
+    # does not have, so it is refused rather than quietly half-done.
+    Test-Diagnostic 'Variable a: [2][2]Word;' 'may only be used for a variable or a parameter'
+}
+Test-Case 'an array has only Length' {
+    Test-Diagnostic 'Variable page: [2]Word; Terminal.Write(page.First());' "an array has no method 'First'"
+}
+Test-Case 'Length takes no arguments' {
+    Test-Diagnostic 'Variable page: [2]Word; Terminal.Write(page.Length(1));' 'Length expects 0 arguments'
+}
+Test-Case 'an array is not a struct field' {
+    # Deferred deliberately: a struct field needs the array's length to be part
+    # of the aggregate's own type, which is the SizeOf question still open.
+    Test-Diagnostic "Struct Pair { a: [2]Word, b: Number }" 'may only be used for a variable or a parameter'
+}
+
 # --- Comments ---------------------------------------------------------------
 
 Test-Case 'line comments are ignored' {

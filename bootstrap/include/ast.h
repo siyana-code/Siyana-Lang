@@ -44,7 +44,9 @@ typedef enum {
     EXPR_UNION_INIT,
     EXPR_TRY,
     EXPR_CATCH,
-    EXPR_ALLOCATOR_NEW
+    EXPR_ALLOCATOR_NEW,
+    EXPR_ARRAY_LITERAL,
+    EXPR_INDEX
 } NodeType;
 
 /* What a type declaration defines. An Error is a union whose variants carry no
@@ -111,8 +113,23 @@ typedef enum {
      * copy: two copies are the same arena, and both hand out the same bytes.
      * That exception to value semantics is deliberate and is recorded in
      * research/design/allocators.md. */
-    TYPE_ALLOCATOR
+    TYPE_ALLOCATOR,
+
+    /* `[N]T` -- a fixed-size array. Value semantics, like a struct: assigning
+     * one copies the elements. The length is fixed at the declaration, which is
+     * what makes an array usable as a page table or a register file. */
+    TYPE_ARRAY
 } TypeKind;
+
+/* The shape of an array type, filled in by the parser when `kind` is
+ * TYPE_ARRAY. Kept beside the declaration rather than inside TypeKind because
+ * a type is three fields wide and TypeKind is shared by every context that
+ * mentions a type at all. */
+typedef struct {
+    size_t length;
+    TypeKind element;
+    char *element_name;      /* owned; set when element is TYPE_NAMED */
+} ArraySpec;
 
 const char *type_kind_name(TypeKind type);
 
@@ -186,7 +203,15 @@ typedef struct Expr {
     char *variant;         /* owned */
     Expr *payload;
 
-    /* EXPR_TRY and EXPR_CATCH use `left` for the fallible expression. */
+    /* EXPR_TRY and EXPR_CATCH use `left` for the fallible expression.
+     * EXPR_INDEX is `left[index]`, using the existing `right` slot.
+     *
+     * Bounds are checked when the element is read or written -- a silent
+     * out-of-bounds access is the kind of wrongness that is expensive to find
+     * later, and impossible to find in a kernel. */
+
+    /* EXPR_ARRAY_LITERAL: `[1, 2, 3]`. The elements are `arguments`; the
+     * declared length comes from the variable's type and must match. */
 
     /* EXPR_CATCH: arms over the callee's error set, parsed exactly like Match
      * arms so there is one grammar for exhaustiveness rather than two. */
@@ -204,6 +229,7 @@ typedef struct {
     char *name;
     TypeKind type;
     char *type_name;       /* owned; set when type is TYPE_NAMED */
+    ArraySpec array;       /* set when type is TYPE_ARRAY */
     Position position;
 } Parameter;
 
@@ -226,6 +252,8 @@ struct Stmt {
     TypeKind declared_type; /* STMT_VARIABLE, STMT_FUNCTION */
     /* When `declared_type` is TYPE_NAMED, this holds the type's name. Owned. */
     char *type_name;
+    /* When `declared_type` is TYPE_ARRAY, the element type and length. */
+    ArraySpec array;
     Expr *initializer;      /* STMT_VARIABLE: may be NULL */
 
     /* Statement arrays.

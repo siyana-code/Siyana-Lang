@@ -654,6 +654,115 @@ An unsigned value prints unsigned. A `Word` of all ones is
 18446744073709551615, not -1; printing it signed reports a mask as a negative
 number and sends the reader looking for a sign bug that is not there.
 
+## 26. Arrays are fixed-size and are values
+
+**Decision.** `[N]T` is an array type; `[a, b, c]` is an array literal, whose
+length must match. Indexing with `[i]` reads or writes an element, and `Length()`
+gives the declared length.
+
+```
+Variable page: [3]Word = [10, 20, 30];
+page[0] = 42;
+Terminal.Write(page.Length());       // 3
+
+Function Sum(table: [4]Word) -> Word {
+    Return table[0] + table[1] + table[2] + table[3];
+}
+```
+
+**How this was chosen: by trying to write the OS.** This was the first gap on the
+list decision 25 produced. A page table is a collection, a register file is a
+collection, and a frame buffer is a collection. Nothing substantial can be
+written without one.
+
+### Fixed size, not a growable list
+
+A fixed length is what makes an array usable as a page table or a device
+register block: the length is a property of the *type*, so it is known before
+any value exists and it cannot change underneath a reader. `page.Length()` is
+available on a variable declared with no literal at all, which is exactly the
+case a kernel hits when it sizes a frame buffer from a constant it has not been
+given yet.
+
+A growable list is a separate feature, and it needs open question 6 answered
+first - a list that reallocates has to say what a reference to it means, and
+nothing in the language currently means "a reference". Adding arrays now without
+solving that is the difference between making progress and creating something to
+undo.
+
+### Values, like structs
+
+Decision 21 said structs are values because reference semantics are subtractive:
+they are convertible later, and unconvertible. The same argument applies exactly
+here, and `page[0] = 42` on a copy that the writer does not hold is a bug that
+compiles and does nothing. So assignment copies the elements and passing to a
+function passes a copy.
+
+The cost is real and known: copying a 512-entry page table on every assignment
+is expensive. It is the same cost C pays, it is visible in the source rather than
+hidden behind a pointer, and `Word` is pointer-width so the copy is a memmove.
+Optimising it later means introducing a borrow, which is decision 24's open
+question 6 -- and an optimisation that can be added is better than a semantic
+that has to be taken away.
+
+### Bounds are checked on every access, and the check cannot be skipped
+
+```
+Variable page: [3]Word = [10, 20, 30];
+Terminal.Write(page[3]);
+```
+
+```
+error: index 3 is outside this array of 3 element(s)
+```
+
+This is the property that makes arrays safe to hand to code that was not written
+to trust it. The language has no pointer arithmetic, so there is no
+pointer-arithmetic mistake for a programmer to make -- which means the check
+here is not defending against the programmer's mistake but against a bug in this
+interpreter. A bounds check that could be switched off would be a check that
+eventually gets switched off.
+
+The check covers both ends, which is why a negative index is an error rather
+than something counted from the other end. Clamping is worse than failing: it
+turns an out-of-range access into a plausible-looking wrong answer.
+
+### The length comes from the type, and the literal must match it
+
+`Variable page: [3]Word = [10, 20];` is an error naming both counts rather than
+a truncation or a pad. A literal that quietly loses elements is a way of
+writing a page table that is missing an entry, and the missing entry is not the
+part that looks wrong.
+
+An array declared without a literal has every element **unset**, not zero. An
+unset element prints as `nothing`. A page table whose entries are all zero is a
+valid and very different thing - it maps everything to the null frame - and
+zeroing an array would claim the programmer had chosen that.
+
+### Deliberately not in this change
+
+- **Arrays as struct fields.** Rejected for now, not in principle: a field's
+  length would have to be part of the aggregate's type, which needs `SizeOf`,
+  which decision 22 left open.
+- **Nested arrays.** `[2][2]Word` is refused with a message saying where an
+  array type may appear. An array of arrays is a two-dimensional structure with
+  no OS use that a struct of arrays does not already cover.
+- **Assigning to a nested index.** `a[0][1] = x` is refused. Only a whole
+  variable is a target; a partial path is a thing to add deliberately rather
+  than half-implement.
+- **Slices.** A `[N]T` with no way to name a sub-range cannot be passed to a
+  function that takes part of one, and that is a real limitation. It is the
+  same missing piece as open question 6, and it is recorded there rather than
+  solved twice.
+
+### On the interpreter's own memory
+
+Arrays add a third value type that owns a heap allocation, joining structs and
+unions in the leak already recorded in `docs/architecture.md`. That is recorded
+as a deliberate cost of moving forward, not fixed here. It should land before
+buffers or pointers, because those make ownership load-bearing rather than an
+implementation detail.
+
 ## Open decisions
 
 Not yet made:
@@ -669,12 +778,13 @@ Not yet made:
    decision 24.
 6. Pointers and borrows. Decision 21 makes structs values and decision 24 makes
    allocators hand out offsets; nothing yet means "a reference to a struct."
-   This is now the blocker for buffers, and for the ergonomics the allocator
-   model was chosen for.
+   Decision 26 gives arrays value semantics for the same reason, which makes
+   this the blocker for both buffers and slices -- a sub-range of an array has
+   no way to be named yet.
 7. May a variable hold a `Result{T, E}`? Currently no, deliberately. See
    decision 23.
 
-**[Note]** The two decisions that blocked Phase 3 are now made (14 and 15).
+**[Note]** The three decisions that blocked Phase 3 are now made (14, 15 and 26).
 Compile-time evaluation remains, and is the next item to settle before the
 semantic core can be built.
 
