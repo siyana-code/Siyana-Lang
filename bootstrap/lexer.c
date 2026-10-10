@@ -23,7 +23,7 @@ typedef struct {
  * so a diagnostic can quote exactly what the programmer wrote. */
 static const char *const kTypeNames[] = {
     "end of file", "error", "identifier", "number", "character", "string",
-    "Number", "Number32", "Word", "Character",
+    "Number", "Number32", "Word", "Character", "String",
     "Variable", "Function",
     "If", "Else", "Loop", "Return",
     "True", "False",
@@ -126,6 +126,7 @@ static TokenType keyword_type(const char *text, size_t length) {
     static const struct { const char *word; TokenType type; } table[] = {
         {"Number", TOKEN_NUMBER_TYPE},   {"Character", TOKEN_CHARACTER_TYPE},
         {"Number32", TOKEN_NUMBER32_TYPE}, {"Word", TOKEN_WORD_TYPE},
+        {"String", TOKEN_STRING_TYPE},
         {"Variable", TOKEN_VARIABLE},    {"Function", TOKEN_FUNCTION},
         {"If", TOKEN_IF},                {"Else", TOKEN_ELSE},
         {"Loop", TOKEN_LOOP},            {"Return", TOKEN_RETURN},

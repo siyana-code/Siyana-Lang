@@ -27,6 +27,9 @@ typedef enum {
     TOKEN_NUMBER32_TYPE,
     TOKEN_WORD_TYPE,
     TOKEN_CHARACTER_TYPE,
+    /* A byte sequence of runtime length (decision 27). Distinct from
+     * TOKEN_STRING, which is a string *literal*. */
+    TOKEN_STRING_TYPE,
 
     /* Declarations */
     TOKEN_VARIABLE,

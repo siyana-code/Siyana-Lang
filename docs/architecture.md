@@ -202,31 +202,31 @@ page table entry is `frame | flags << 48`) and produced the remaining list:
 | Missing | Blocks | Status |
 | --- | --- | --- |
 | Arrays / lists | a page table is a collection | **Landed** — decision 26. Growable lists are still missing, and need open question 6 |
-| `String` as a type, length, concatenation | file paths, command lines | **Last blocking item** |
+| `String` as a type, length, concatenation | file paths, command lines | **Landed** — decision 27. String to array, and lexicographic comparison, are still missing |
 | `const` named constants | `PAGE_SIZE`, register bit masks | The concrete need the deferred compile-time-evaluation question keeps turning up |
 | `enum` | device states, status codes | |
 | `SizeOf` | struct layout, which decision 22 requires to be specified | Also blocks arrays as struct fields |
 | `For` | convenience only; `Loop` covers it | |
 | Compound assignment (`<<=`, `|=`) | convenience only | |
-| Slices | passing part of an array | Same blocker as buffers — nothing yet means "a reference" |
+| Slices | passing part of an array, String to array | Same blocker as buffers — nothing yet means "a reference". Strings are exempt (decision 27) |
 
 Nothing on this list is a redesign. They are additions to a language whose hard
 decisions are made, which is the state Phase 3 was supposed to reach.
 
 **Remaining**
 
-1. A `String` type — the last thing blocking writing anything substantial.
-   Arrays landed in decision 26; a string is the other half.
-2. Named constants, which is also the concrete need the deferred
+The two items that blocked writing anything substantial have landed: arrays in
+decision 26, `String` in decision 27. What is left:
+
+1. Named constants, which is also the concrete need the deferred
    compile-time-evaluation question keeps turning up.
-3. Buffers and borrows, which unblock the ergonomics the allocator model was
-   chosen for. Allocators currently hand out offsets because nothing yet means
-   "a reference to a struct" (decision 24). Slices are blocked on the same
-   question: a sub-range of an array has no way to be named.
-4. `enum`, `SizeOf`, `For`, compound assignment — convenience, not blocking.
+2. Buffers, borrows, and slices — open question 6. Allocators currently hand
+   out offsets because nothing yet means "a reference to a struct" (decision
+   24), and a sub-range of an array is blocked on the same thing.
+3. `enum`, `SizeOf`, `For`, compound assignment — convenience, not blocking.
 
 **[Known defect]** Every struct and union value leaks its `fields` array, and
-every array value now leaks its `elements`. `free_aggregate_fields` is reached
+every array value leaks its `elements`. `free_aggregate_fields` is reached
 only from the error paths inside `evaluate_struct_init` and `evaluate_union_init`;
 nothing on the success path frees, and `scope_destroy` releases the name but not
 the value. A program that builds a struct in a loop grows memory without bound.
@@ -236,6 +236,11 @@ Recorded rather than fixed because the fix needs a decision, not a patch: a
 21 and 26) *and* deep-freed when dropped, which puts that responsibility at
 every `Value` copy site. Half of it — the copy half — is already done via
 `value_copy`. The free half is not.
+
+Strings are not in this list any more. Decision 27 moved them to an arena with
+a single owner and freed at exit, which was possible precisely because they had
+no borrow — a string literal pointed into the AST and `ReadLine` pointed into a
+buffer it did not own. Making that uniform was the whole fix.
 
 Survivable while the interpreter is a bootstrap tool that will itself be
 replaced; not survivable in the language. Compounding it, the Phase 2 note

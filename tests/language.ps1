@@ -1224,11 +1224,6 @@ Test-Case 'an array length must be greater than zero' {
 Test-Case 'indexing a Number is an error' {
     Test-Diagnostic 'Variable n: Number = 5; Terminal.Write(n[0]);' 'cannot index Number'
 }
-Test-Case 'indexing a String is an error' {
-    # Strings are not arrays of bytes yet. This is a gap, not a ruling -- but
-    # saying so here means the test will change when it is filled.
-    Test-Diagnostic 'Terminal.Write("abc"[0]);' 'cannot index String'
-}
 Test-Case 'a nested index is refused' {
     # Only a whole variable is a target. `a[0][1] = x` would need a path this
     # does not have, so it is refused rather than quietly half-done.
@@ -1244,6 +1239,190 @@ Test-Case 'an array is not a struct field' {
     # Deferred deliberately: a struct field needs the array's length to be part
     # of the aggregate's own type, which is the SizeOf question still open.
     Test-Diagnostic "Struct Pair { a: [2]Word, b: Number }" 'may only be used for a variable or a parameter'
+}
+
+# --- Strings ----------------------------------------------------------------
+
+Test-Case 'String is a type' {
+    Test-Output 'Variable s: String = "hello"; Terminal.Write(s);' @('hello')
+}
+Test-Case 'String Length' {
+    # The whole reason String is not `[N]Character`: the length is a runtime
+    # value, so it is only knowable by asking.
+    Test-Output 'Variable s: String = "hello"; Terminal.Write(s.Length());' @('5')
+}
+Test-Case 'an empty String has length zero' {
+    Test-Output 'Variable s: String = ""; Terminal.Write(s.Length());' @('0')
+}
+Test-Case 'a String indexes to a Character' {
+    # A byte, not a String of length 1. The byte is what a byte buffer is made
+    # of and what `path[i] == '/'` tests with.
+    $src = @'
+Variable s: String = "hello";
+Variable i: Word = 0;
+Loop i < s.Length() {
+    Terminal.Write(s[i]);
+    i = i + 1;
+}
+'@
+    Test-Output $src @('h', 'e', 'l', 'l', 'o')
+}
+Test-Case 'a String index past the end is an error' {
+    $src = @'
+Variable s: String = "hello";
+Terminal.Write(s[5]);
+'@
+    Test-Diagnostic $src 'index 5 is outside this String of 5 byte\(s\)'
+}
+Test-Case 'a negative String index is an error' {
+    Test-Diagnostic 'Variable s: String = "hello"; Terminal.Write(s[-1]);' 'must not be negative'
+}
+Test-Case 'two Strings concatenate' {
+    Test-Output 'Variable s: String = "hello" + ", world"; Terminal.Write(s);' @('hello, world')
+}
+Test-Case 'concatenation builds a String' {
+    # The result is a String, not a print. This is how a path is assembled.
+    $src = @'
+Variable base: String = "/usr";
+Variable name: String = "/bin";
+Terminal.Write(base + name);
+'@
+    Test-Output $src @('/usr/bin')
+}
+Test-Case 'concatenation is left to right' {
+    Test-Output 'Variable s: String = "a" + "b" + "c"; Terminal.Write(s);' @('abc')
+}
+Test-Case 'a Character may be appended' {
+    # How a String gets built a byte at a time when the length is not known
+    # in advance -- the case no fixed-size array can hold.
+    Test-Output 'Variable s: String = "path" + 47 + "bin"; Terminal.Write(s);' @('path/bin')
+}
+Test-Case 'appending a Character variable' {
+    $src = @'
+Variable slash: Character = 47;
+Variable s: String = "path" + slash + "bin";
+Terminal.Write(s);
+'@
+    Test-Output $src @('path/bin')
+}
+Test-Case 'a Character does not become a String' {
+    # A byte is not a byte sequence. Allowing it would make `s[0]` and a
+    # one-character String indistinguishable at the type level, and the length
+    # of the first is not the length of the second.
+    Test-Diagnostic "Variable s: String = 'a';" "cannot initialise 's' of type String with Character"
+}
+Test-Case 'a Number too large for a byte cannot be appended' {
+    # Narrowing applies only when the value fits. Silently truncating 300 to
+    # 44 would put a wrong byte in a path.
+    Test-Diagnostic 'Variable s: String = "ab" + 300;' 'cannot append Number to a String'
+}
+Test-Case 'a Character cannot be prepended' {
+    # `'x' + "yz"` does not read as prepending. Allowing one order and not
+    # the other is how a byte ends up at the wrong end of a path.
+    Test-Diagnostic 'Variable s: String = 120 + "yz";' "cannot apply '\+' to Number and String"
+}
+Test-Case 'a String plus a Number is not a Number' {
+    Test-Diagnostic 'Variable s: String = "ab"; Variable n: Number = s + 1;' "cannot initialise 'n' of type Number with String"
+}
+Test-Case 'a Number plus a String is not a Number' {
+    Test-Diagnostic 'Variable s: String = "ab"; Variable n: Number = 1 + s;' "cannot apply '\+' to Number and String"
+}
+Test-Case 'Length is a Word, not a Number' {
+    # Same as an array's Length. Declaring it `Number` would mean every use
+    # mixes widths, and decision 20 refuses that.
+    $src = @'
+Variable s: String = "hello";
+Variable n: Word = s.Length();
+Variable a: [5]Character = [104, 101, 108, 108, 111];
+Terminal.Write(n == a.Length());
+'@
+    Test-Output $src @('True')
+}
+Test-Case 'String equality compares contents' {
+    Test-Output 'Variable a: String = "abc"; Variable b: String = "abc"; Terminal.Write(a == b);' @('True')
+}
+Test-Case 'a String is a value, not a reference' {
+    # Nothing to copy: the bytes live in the run's arena and both names point
+    # at them. What matters is that the names cannot diverge.
+    $src = @'
+Variable a: String = "one";
+Variable b: String = a;
+a = a + "!";
+Terminal.Write(a);
+Terminal.Write(b);
+'@
+    Test-Output $src @('one!', 'one')
+}
+Test-Case 'a String may be a function parameter and return value' {
+    $src = @'
+Function Twice(text: String) -> String {
+    Return text + text;
+}
+Terminal.Write(Twice("ab"));
+'@
+    Test-Output $src @('abab')
+}
+Test-Case 'a String may be a struct field' {
+    $src = @'
+Struct Line { text: String, width: Number }
+Variable l: Line = Line { text: "hi", width: 2 };
+Terminal.Write(l.text);
+'@
+    Test-Output $src @('hi')
+}
+Test-Case 'a Character array may be read as text' {
+    # The bridge an OS needs: a file arrives as bytes, a path is a String.
+    $src = @'
+Variable bytes: [5]Character = [47, 117, 115, 114, 47];
+Variable path: String = bytes.Text();
+Terminal.Write(path.Length());
+Terminal.Write(path);
+'@
+    Test-Output $src @('5', '/usr/')
+}
+Test-Case 'Text needs an array of Character' {
+    Test-Diagnostic 'Variable a: [2]Word = [1, 2]; Terminal.Write(a.Text());' 'Text needs an array of Character, got an array of Word'
+}
+Test-Case 'a String has only Length' {
+    Test-Diagnostic 'Variable s: String = "x"; Terminal.Write(s.First());' "a String has no method 'First'"
+}
+Test-Case 'Length takes no arguments' {
+    Test-Diagnostic 'Variable s: String = "x"; Terminal.Write(s.Length(1));' 'Length expects 0 arguments'
+}
+Test-Case 'a String may not be declared from a Number' {
+    Test-Diagnostic 'Variable s: String = 5;' "cannot initialise 's' of type String"
+}
+Test-Case 'an empty Character array cannot be read as text' {
+    # An array of length zero is not expressible, so this documents the shape
+    # rather than a behaviour.
+    Test-Diagnostic 'Variable a: [0]Character;' 'greater than zero'
+}
+Test-Case 'a String built in a loop grows correctly' {
+    # Repeated concatenation is quadratic and that is known; what is checked
+    # here is that every append lands where the previous one ended.
+    $src = @'
+Variable s: String = "";
+Variable i: Number = 0;
+Loop i < 5 {
+    s = s + "ab";
+    i = i + 1;
+}
+Terminal.Write(s.Length());
+Terminal.Write(s);
+'@
+    Test-Output $src @('10', 'ababababab')
+}
+Test-Case 'a String is not an array' {
+    # The two have different lengths: one is fixed by its type, the other is
+    # not. Saying so is the point of having both.
+    $src = @'
+Variable s: String = "hello";
+Variable n: Word = s.Length();
+Variable a: [5]Character = [104, 101, 108, 108, 111];
+Terminal.Write(n);
+Terminal.Write(a.Text() == s);
+'@
+    Test-Output $src @('5', 'True')
 }
 
 # --- Comments ---------------------------------------------------------------

@@ -104,6 +104,11 @@ Variable page: [3]Word = [10, 20, 30];
 page[0] = 42;
 Terminal.Write(page[0]);        // 42
 Terminal.Write(page.Length());   // 3
+
+// A String's length is a runtime value, so it can hold what an array cannot.
+Variable path: String = "/usr" + "/bin";
+Terminal.Write(path.Length());   // 8
+Terminal.Write(path[0]);         // '/'
 ```
 
 Operators: `+ - * /`, `== != < <= > >=`, `& | ^ ~ << >>`, unary `-` and `!`.
@@ -154,8 +159,15 @@ error naming the index and the length rather than a silent read of whatever is
 next in memory. Assignment copies the elements, like a struct — there is no
 aliasing to reason about. See [decision 26](research/decisions.md).
 
-Deliberately **not** implemented yet: a `String` type, buffers, borrows, slices,
-modules, and pointers.
+**`String` is a byte sequence whose length is a runtime value.** Not
+`[N]Character`: an array's length is fixed by its type, a file's is not.
+Indexes give a `Character`, `+` concatenates, and `Length()` is the only
+method. It is immutable and has no `s[i] = x` — a growable byte buffer is a
+list, and that is a separate decision. See
+[decision 27](research/decisions.md).
+
+Deliberately **not** implemented yet: buffers, borrows, slices, modules, and
+pointers.
 
 **Allocation is explicit and failure is a value.** An `Allocator` owns a region;
 `Allocate` returns an offset into it and `OutOfMemory` is a normal error to

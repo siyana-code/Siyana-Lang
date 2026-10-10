@@ -773,6 +773,94 @@ as a deliberate cost of moving forward, not fixed here. It should land before
 buffers or pointers, because those make ownership load-bearing rather than an
 implementation detail.
 
+## 27. `String` is a value type with a runtime length
+
+**Decision.** `String` is its own type, distinct from `[N]Character`. It has
+`.Length()`, indexes to a `Character`, and concatenates with `+`.
+
+```
+Variable path: String = "/usr" + "/bin";
+Terminal.Write(path.Length());       // 8
+Terminal.Write(path[0]);             // '/'
+
+Variable raw: [5]Character = [47, 98, 111, 111, 116];
+Variable name: String = raw.Text(); //  "/boot"
+```
+
+This was the last item on the Phase 3 gap list that blocked writing something
+substantial. A file path, a command line, and the result of a read all have a
+length nobody knew when the program was written.
+
+### Why it is not `[N]Character`
+
+Because the length is not known in advance. An array's length is fixed by its
+declaration, so it is a property of the type; a string's is a property of the
+value. `[N]Character` cannot hold a file whose size is only known after
+reading it, and there is no `[s.Length()]` to write, because the array type
+would then depend on a runtime value — which is not a type.
+
+That is the whole distinction, and it is worth keeping visible rather than
+unifying. The two convert: `raw.Text()` for bytes into a String, and `s[i]` for
+a String out a byte at a time. What is deliberately absent is String into
+array, for the reason just given.
+
+### The useful consequence: strings can be sliced, arrays cannot
+
+An array's sub-range would have a runtime length, so it cannot be an array — it
+would need to be a *reference* into the original, and nothing in the language
+means that yet (open question 6). A String's sub-range is already a String: its
+length is a runtime value, and a substring is a shorter view of the same bytes.
+
+So slicing is blocked on open question 6 for arrays and *not* for strings.
+That asymmetry is a real argument for keeping them separate rather than making
+`String` a typedef for a byte sequence, and it is why this decision does not
+have to settle references to move forward.
+
+### Immutable
+
+A String has no `s[i] = x`. A growable byte buffer is a list, and a list has to
+say what a reference to it means — the same question. Deferring it keeps String
+from being half a list.
+
+### Bytes live in the run's arena, and that is the whole ownership rule
+
+A String does not own its characters; it points into an arena that lives for
+the length of the run and is freed once at exit.
+
+This replaces two different behaviours that were already there and disagreed.
+A string literal borrowed the AST, which is fine until a String is built by
+something else; `Terminal.ReadLine` returned an owned buffer and a second call
+*invalidated the first result*, which was documented at the call site rather
+than defended against because there was nowhere to put it. Now every String
+comes from the same place, so a String copied by assignment copies no bytes and
+cannot dangle.
+
+The cost, stated plainly: a program that concatenates in a loop grows the
+arena without bound. It is bounded by the run and freed at exit, which is the
+right trade for a bootstrap interpreter and is the wrong trade for a long-lived
+one. Making it refcounted or scope-scoped later is additive.
+
+### A Character may be appended, but not prepended
+
+`"path" + '/'` reads as appending and `'/' + "path"` does not. Allowing one
+order without the other is how a byte ends up at the wrong end of a path, so
+the other direction is an error naming both types.
+
+Appending takes a `Character`, and a `Number` literal narrows to one when it
+fits — the same rule an array element and a variable initialiser get. `"A" + 65`
+is something a programmer means. `300` does not fit and is refused rather than
+truncated to 44, because a wrong byte in a path is worse than a failed build.
+
+### What is still missing
+
+- **String to array.** Needs an array whose length is a runtime value, which is
+  a slice.
+- **Comparison beyond `==`.** Lexicographic ordering is useful for sorting
+  arguments and paths; deliberately not added until something wants it.
+- **`Terminal.ReadLine` returning `String`.** It already produces a String; it
+  is not yet annotated as one. That is a Phase 5 item with the rest of the CLI
+  library.
+
 ## Open decisions
 
 Not yet made:
@@ -786,11 +874,12 @@ Not yet made:
    so adding them later is additive rather than a redesign.
 5. Automatic versus explicit arena deinit. **Decided: explicit** — see
    decision 24.
-6. Pointers and borrows. Decision 21 makes structs values and decision 24 makes
-   allocators hand out offsets; nothing yet means "a reference to a struct."
-   Decision 26 gives arrays value semantics for the same reason, which makes
-   this the blocker for both buffers and slices -- a sub-range of an array has
-   no way to be named yet.
+6. Pointers and borrows. Decision 21 makes structs values, decision 24 makes
+   allocators hand out offsets, and decision 26 gives arrays value semantics for
+   the same reason. Nothing yet means "a reference to a struct" or "a reference
+   to part of an array", which is what blocks buffers and slices.
+   Decision 27 records the asymmetry: a String can be sliced without a
+   reference, because its length is already a runtime value.
 7. May a variable hold a `Result{T, E}`? Currently no, deliberately. See
    decision 23.
 
