@@ -199,15 +199,16 @@ in*. Rather than assume, an OS-shaped program was written and run to find what
 would not compile. That found the blocking gap (no bitwise operators at all — a
 page table entry is `frame | flags << 48`) and produced the remaining list:
 
-| Missing | Blocks |
-| --- | --- |
-| Arrays / lists | a page table is a collection |
-| `String` as a type, length, concatenation | file paths, command lines |
-| `const` named constants | `PAGE_SIZE`, register bit masks |
-| `enum` | device states, status codes |
-| `SizeOf` | struct layout, which decision 22 requires to be specified |
-| `For` | convenience only; `Loop` covers it |
-| Compound assignment (`<<=`, `|=`) | convenience only |
+| Missing | Blocks | Status |
+| --- | --- | --- |
+| Arrays / lists | a page table is a collection | **Landed** — decision 26. Growable lists are still missing, and need open question 6 |
+| `String` as a type, length, concatenation | file paths, command lines | **Last blocking item** |
+| `const` named constants | `PAGE_SIZE`, register bit masks | The concrete need the deferred compile-time-evaluation question keeps turning up |
+| `enum` | device states, status codes | |
+| `SizeOf` | struct layout, which decision 22 requires to be specified | Also blocks arrays as struct fields |
+| `For` | convenience only; `Loop` covers it | |
+| Compound assignment (`<<=`, `|=`) | convenience only | |
+| Slices | passing part of an array | Same blocker as buffers — nothing yet means "a reference" |
 
 Nothing on this list is a redesign. They are additions to a language whose hard
 decisions are made, which is the state Phase 3 was supposed to reach.

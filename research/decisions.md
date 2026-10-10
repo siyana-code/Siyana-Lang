@@ -284,6 +284,16 @@ adding them later breaks nothing.
 `Number`). Rust and C# allow it; Zig does not. Recommendation: allow, since it
 is genuinely lossless on every target.
 
+**[Defect, fixed in #17]** Guarantee 2 was not correctly implemented. Overflow is
+checked on the unsigned representation of the result so that signed overflow in
+the host language cannot defeat it — right for addition, wrong for subtraction,
+where the two's complement of a negative number is enormous. The check only ran
+for unsigned types, so `2 - 5` and `0 - 1` were reported as overflows and failed.
+Every subtraction test happened to stay non-negative, which is how a suite
+checking the happy path misses this. Fixed, and recorded here because the
+guarantee is load-bearing for the whole language: an overflow check that also
+rejects valid results trains people to distrust it.
+
 ## 19. `Terminal` is a value, not a module
 
 **Decision.** Design `Terminal` as a value with methods, not as a namespace of
