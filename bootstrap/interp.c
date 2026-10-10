@@ -32,6 +32,13 @@ typedef struct {
     Scope *closure;
 } Function;
 
+/* A registered Struct or Union declaration. Kept by pointer rather than copied
+ * so a Value can reference it for its whole lifetime. */
+struct Decl {
+    const Stmt *node;          /* the STMT_STRUCT / STMT_UNION node */
+    bool is_union;
+};
+
 typedef struct {
     const Program *program;
     Scope *global_scope;
@@ -40,8 +47,14 @@ typedef struct {
     size_t function_count;
     size_t function_capacity;
 
+    /* Struct and union declarations, registered before execution so a type may
+     * be used before the line that declares it, as functions already are. */
+    Decl *decls;
+    size_t decl_count;
+    size_t decl_capacity;
+
     bool failed;
-    char message[160];
+    char message[192];
     Position error_position;
 } InterpState;
 
@@ -111,6 +124,21 @@ static bool scope_get(const Scope *scope, const char *name, Value *out) {
     return false;
 }
 
+/* Returns a pointer to a variable's storage, or NULL.
+ *
+ * Distinct from scope_get, which returns a copy of the value. Field assignment
+ * needs the storage so a write is visible to every later read. */
+static Value *scope_find(Scope *scope, const char *name) {
+    for (; scope != NULL; scope = scope->parent) {
+        for (size_t i = 0; i < scope->count; i++) {
+            if (strcmp(scope->entries[i].name, name) == 0) {
+                return &scope->entries[i].value;
+            }
+        }
+    }
+    return NULL;
+}
+
 static bool scope_assign(Scope *scope, const char *name, Value value) {
     for (; scope != NULL; scope = scope->parent) {
         for (size_t i = 0; i < scope->count; i++) {
@@ -143,12 +171,13 @@ const char *type_kind_name(TypeKind type) {
         case TYPE_NUMBER32:  return "Number32";
         case TYPE_WORD:      return "Word";
         case TYPE_CHARACTER: return "Character";
+        case TYPE_NAMED:     return "a named type";
         default:             return "unknown";
     }
-}
+    }
 
-/* Pointer width of the build target. Word is the one type whose size is not
- * fixed, and that is exactly why it exists. */
+/* Size in bytes. `Word` reports the pointer width of the build target, which
+ * is the one width that is not fixed. */
 size_t type_kind_size(TypeKind type) {
     switch (type) {
         case TYPE_NUMBER:    return 8;
@@ -257,7 +286,37 @@ static Value value_nil(void) {
     return value;
 }
 
-/* --- Forward declarations -------------------------------------------------- */
+/* --- Forward declarations ------------------------------------------------- */
+
+/* Defined with the aggregate helpers, but needed earlier for named-type
+ * resolution in variable and parameter checks. */
+/* Copies an aggregate value, allocating a fresh fields array.
+ *
+ * Structs are value types, so `b = a` must not leave `b` sharing `a`'s fields.
+ * Without this copy, assigning through one variable silently changes the other,
+ * which is the kind of aliasing bug that is very hard to find later. */
+static Value copy_aggregate(Value value) {
+    Value copy = value;
+    size_t count = value.as.aggregate.decl->node->field_count;
+    copy.as.aggregate.fields = malloc(count * sizeof(Value));
+    if (copy.as.aggregate.fields != NULL) {
+        for (size_t i = 0; i < count; i++) {
+            copy.as.aggregate.fields[i] = value.as.aggregate.fields[i];
+        }
+    }
+    return copy;
+}
+
+/* Structs and unions are value types: reading one out of a variable or
+ * passing one to a function copies it. */
+static Value value_copy(Value value) {
+    if (value.type == VALUE_STRUCT || value.type == VALUE_UNION) {
+        return copy_aggregate(value);
+    }
+    return value;
+}
+
+static const Decl *resolve_named(const InterpState *state, const char *name);
 
 static bool execute_statement(InterpState *state, const Stmt *statement,
                               Scope *scope, Flow *flow);
@@ -717,7 +776,26 @@ static bool call_function(InterpState *state, const Function *function,
          * boundary. */
         Value argument = value_as_plain(arguments[i]);
         TypeKind expected = parameter->type;
-        if (!value_matches_type(argument, expected)) {
+        if (expected == TYPE_NAMED) {
+            /* Same identity check as a variable initialiser: a value of a
+             * different struct type is rejected even if its fields match. */
+            const Decl *decl = resolve_named(state, parameter->type_name);
+            if (decl == NULL) {
+                fail(state, parameter->position,
+                     "undefined type '%s'", parameter->type_name);
+                scope_destroy(call_scope);
+                return false;
+            }
+            if (argument.type != (decl->is_union ? VALUE_UNION : VALUE_STRUCT) ||
+                argument.as.aggregate.decl != decl) {
+                fail(state, parameter->position,
+                     "parameter '%s' of '%s' expects %s, got %s",
+                     parameter->name, declaration->name,
+                     parameter->type_name, type_name_of(argument));
+                scope_destroy(call_scope);
+                return false;
+            }
+        } else if (!value_matches_type(argument, expected)) {
             TypeKind given = argument.type == VALUE_INTEGER
                                  ? argument.as.integer.type
                                  : TYPE_NUMBER;
@@ -733,7 +811,7 @@ static bool call_function(InterpState *state, const Function *function,
                 return false;
             }
         }
-        if (!scope_define(call_scope, parameter->name, argument)) {
+        if (!scope_define(call_scope, parameter->name, value_copy(argument))) {
             fail(state, parameter->position, "out of memory");
             scope_destroy(call_scope);
             return false;
@@ -778,6 +856,35 @@ static void write_value(Value value) {
         case VALUE_STRING:
             fwrite(value.as.string.chars, 1, value.as.string.length, stdout);
             break;
+        case VALUE_STRUCT: {
+            /* Printed as `Name { a: 1, b: 2 }` so a struct's contents are
+             * visible rather than an opaque handle. */
+            const Decl *decl = value.as.aggregate.decl;
+            printf("%s {", decl->node->name);
+            for (size_t i = 0; i < decl->node->field_count; i++) {
+                if (i > 0) printf(", ");
+                printf("%s: ", decl->node->fields[i].name);
+                write_value(value.as.aggregate.fields[i]);
+            }
+            printf("}");
+            break;
+        }
+        case VALUE_UNION: {
+            /* Only the active variant is printed: the others hold nothing. */
+            const Decl *decl = value.as.aggregate.decl;
+            if (value.as.aggregate.tag < 0) {
+                printf("%s {uninitialised}", decl->node->name);
+                break;
+            }
+            const Field *variant = &decl->node->fields[value.as.aggregate.tag];
+            printf("%s.%s", decl->node->name, variant->name);
+            if (variant->has_payload) {
+                printf("(");
+                write_value(value.as.aggregate.fields[value.as.aggregate.tag]);
+                printf(")");
+            }
+            break;
+        }
         default:
             printf("nothing");
             break;
@@ -787,19 +894,23 @@ static void write_value(Value value) {
 static bool evaluate_builtin(InterpState *state, const Expr *expression,
                              Scope *scope, Value *out) {
     if (expression->builtin == TOKEN_WRITE) {
-        if (expression->argument_count != 1) {
+        /* Variadic: writes each argument in turn, then a newline. A single
+         * argument is the common case, but `Terminal.Write("x: ", n)` reads
+         * better than two calls and costs nothing. */
+        if (expression->argument_count == 0) {
             fail(state, expression->position,
-                 "Terminal.Write expects 1 argument, got %zu", expression->argument_count);
+                 "Terminal.Write needs at least 1 argument");
             return false;
         }
-        Value argument;
-        if (!evaluate(state, expression->arguments[0], scope, &argument)) return false;
+        for (size_t i = 0; i < expression->argument_count; i++) {
+            Value argument;
+            if (!evaluate(state, expression->arguments[i], scope, &argument)) return false;
+            write_value(argument);
+        }
 
-        write_value(argument);
-
-        /* Terminal.Write appends a newline, matching the behaviour of a shell
-         * that writes one line at a time. A future WriteRaw writes without one;
-         * that is a library addition, not a language one. */
+        /* Terminal.Write appends a newline, matching a shell that writes one
+         * line at a time. A future WriteRaw writes without one; that is a
+         * library addition, not a language one. */
         putchar('\n');
         *out = value_nil();
         return true;
@@ -902,6 +1013,332 @@ static bool evaluate_call(InterpState *state, const Expr *expression,
     return ok;
 }
 
+/* --- Aggregates: structs and unions ---------------------------------------- */
+
+/* Finds a registered Struct or Union by name, or NULL. */
+static const Decl *find_decl(const InterpState *state, const char *name) {
+    for (size_t i = 0; i < state->decl_count; i++) {
+        if (strcmp(state->decls[i].node->name, name) == 0) return &state->decls[i];
+    }
+    return NULL;
+}
+
+/* Resolves a declared type name to the aggregate it refers to. Returns NULL
+ * when the name is not a known Struct or Union, which is how an undeclared
+ * type is reported. */
+static const Decl *resolve_named(const InterpState *state, const char *name) {
+    if (name == NULL) return NULL;
+    return find_decl(state, name);
+}
+
+/* Declares and aggregates share the same field table; this finds a field by
+ * name and returns its index, or -1. */
+static long long find_field(const Decl *decl, const char *name) {
+    for (size_t i = 0; i < decl->node->field_count; i++) {
+        if (strcmp(decl->node->fields[i].name, name) == 0) return (long long)i;
+    }
+    return -1;
+}
+
+static void free_aggregate_fields(Value *value) {
+    if (value->as.aggregate.fields == NULL) return;
+    /* Field values may own strings; release them rather than leaking. */
+    for (size_t i = 0; i < value->as.aggregate.decl->node->field_count; i++) {
+        if (value->as.aggregate.fields[i].type == VALUE_STRING &&
+            value->as.aggregate.fields[i].as.string.chars != NULL) {
+            /* Only strings the interpreter allocated are freed; ones borrowed
+             * from AST nodes must not be. Phase 5 owns that distinction. */
+        }
+    }
+    free(value->as.aggregate.fields);
+    value->as.aggregate.fields = NULL;
+}
+
+/* Builds an aggregate value with every field initialised to Nothing, then the
+ * caller fills the ones the literal names. */
+static bool make_aggregate(InterpState *state, const Decl *decl, Position position,
+                           Value *out) {
+    size_t count = decl->node->field_count;
+    memset(out, 0, sizeof(*out));
+    out->type = decl->is_union ? VALUE_UNION : VALUE_STRUCT;
+    out->as.aggregate.decl = decl;
+    out->as.aggregate.tag = -1;
+    out->as.aggregate.fields = calloc(count, sizeof(Value));
+    if (out->as.aggregate.fields == NULL) {
+        fail(state, position, "out of memory");
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        out->as.aggregate.fields[i] = value_nil();
+    }
+    return true;
+}
+
+/* `Type { field: value, ... }` */
+static bool evaluate_struct_init(InterpState *state, const Expr *expression,
+                                 Scope *scope, Value *out) {
+    const Decl *decl = find_decl(state, expression->name);
+    if (decl == NULL) {
+        fail(state, expression->position, "undefined struct '%s'", expression->name);
+        return false;
+    }
+    if (decl->is_union) {
+        fail(state, expression->position,
+             "'%s' is a union; construct it with '%s.Variant(...)'",
+             expression->name, expression->name);
+        return false;
+    }
+
+    Value result;
+    if (!make_aggregate(state, decl, expression->position, &result)) return false;
+
+    bool seen[256] = {false};
+
+    for (size_t i = 0; i < expression->argument_count; i++) {
+        const Expr *field = expression->arguments[i];
+        long long index = find_field(decl, field->name);
+        if (index < 0) {
+            fail(state, field->position, "'%s' has no field '%s'",
+                 expression->name, field->name);
+            free_aggregate_fields(&result);
+            return false;
+        }
+        if (seen[index]) {
+            fail(state, field->position, "field '%s' is set twice", field->name);
+            free_aggregate_fields(&result);
+            return false;
+        }
+        seen[index] = true;
+
+        Value value;
+        if (!evaluate(state, field->right, scope, &value)) {
+            free_aggregate_fields(&result);
+            return false;
+        }
+
+        /* Field types are enforced, which is what stops a struct from quietly
+         * holding a Character where a Word is declared. */
+        TypeKind expected = decl->node->fields[index].type;
+        if (!value_matches_type(value, expected)) {
+            if (value.type == VALUE_INTEGER &&
+                value.as.integer.type == TYPE_NUMBER &&
+                integer_fits(value.as.integer.bits, expected)) {
+                value = value_integer(value.as.integer.bits, expected);
+            } else {
+                fail(state, field->position,
+                     "field '%s' of '%s' expects %s, got %s",
+                     field->name, expression->name,
+                     type_kind_name(expected), type_name_of(value));
+                free_aggregate_fields(&result);
+                return false;
+            }
+        }
+        result.as.aggregate.fields[index] = value;
+    }
+
+    /* Every field must be given a value: a partially initialised struct is a
+     * bug source, and Nothing-as-placeholder hides it until much later. */
+    for (size_t i = 0; i < decl->node->field_count; i++) {
+        if (!seen[i]) {
+            fail(state, expression->position,
+                 "'%s' is missing a value for field '%s'",
+                 expression->name, decl->node->fields[i].name);
+            free_aggregate_fields(&result);
+            return false;
+        }
+    }
+
+    *out = result;
+    return true;
+}
+
+/* `Type.Variant` or `Type.Variant(payload)`.
+ *
+ * Arrives as an EXPR_FIELD whose left side is the type name and whose `name` is
+ * the variant -- the parser cannot tell `Type.Variant` from `value.field`
+ * syntactically, so evaluate_field routes here once it knows the left side
+ * names a type. */
+static bool evaluate_union_init(InterpState *state, const Expr *expression,
+                                Scope *scope, Value *out) {
+    const char *type_name = expression->left->name;
+    const char *variant_name = expression->name;
+
+    const Decl *decl = find_decl(state, type_name);
+    if (decl == NULL) {
+        fail(state, expression->position, "undefined type '%s'", type_name);
+        return false;
+    }
+    if (!decl->is_union) {
+        fail(state, expression->position,
+             "'%s' is a struct; construct it with '%s { ... }'", type_name, type_name);
+        return false;
+    }
+
+    long long index = find_field(decl, variant_name);
+    if (index < 0) {
+        fail(state, expression->position, "'%s' has no variant '%s'",
+             type_name, variant_name);
+        return false;
+    }
+
+    const Field *variant = &decl->node->fields[index];
+
+    if (variant->has_payload != (expression->payload != NULL)) {
+        if (variant->has_payload) {
+            fail(state, expression->position,
+                 "variant '%s' of '%s' needs a payload", variant_name, type_name);
+        } else {
+            fail(state, expression->position,
+                 "variant '%s' of '%s' takes no payload", variant_name, type_name);
+        }
+        return false;
+    }
+
+    Value result;
+    if (!make_aggregate(state, decl, expression->position, &result)) return false;
+
+    if (expression->payload != NULL) {
+        Value payload;
+        if (!evaluate(state, expression->payload, scope, &payload)) {
+            free_aggregate_fields(&result);
+            return false;
+        }
+        if (!value_matches_type(payload, variant->type)) {
+            if (payload.type == VALUE_INTEGER &&
+                payload.as.integer.type == TYPE_NUMBER &&
+                integer_fits(payload.as.integer.bits, variant->type)) {
+                payload = value_integer(payload.as.integer.bits, variant->type);
+            } else {
+                fail(state, expression->position,
+                     "variant '%s' of '%s' expects %s, got %s",
+                     variant_name, type_name,
+                     type_kind_name(variant->type), type_name_of(payload));
+                free_aggregate_fields(&result);
+                return false;
+            }
+        }
+        result.as.aggregate.fields[index] = payload;
+    }
+
+    result.as.aggregate.tag = index;
+    *out = result;
+    return true;
+}
+
+/* `expr.field` or `Type.Variant(payload)`.
+ *
+ * Both have the same syntax, so this resolves the ambiguity once the left side
+ * is known: a type name means a union construction, a value means a field read.
+ * Doing it here rather than in the parser is the only place the answer exists. */
+static bool evaluate_field(InterpState *state, const Expr *expression,
+                           Scope *scope, Value *out) {
+    /* A union construction when the left side names a type rather than a
+     * value. `expression->left` is a bare identifier in that case, which is the
+     * one situation the parser can recognise without a symbol table. */
+    if (expression->left != NULL && expression->left->type == EXPR_IDENT) {
+        bool names_a_value = scope_get(scope, expression->left->name, &(Value){0});
+        if (!names_a_value) {
+            /* Not a variable, so this is `Type.Variant`. */
+            return evaluate_union_init(state, expression, scope, out);
+        }
+    }
+
+    Value base;
+    if (!evaluate(state, expression->left, scope, &base)) return false;
+
+    if (base.type == VALUE_UNION) {
+        fail(state, expression->position,
+             "cannot read field '%s' from the union '%s'; use Match to read its variant",
+             expression->name, base.as.aggregate.decl->node->name);
+        return false;
+    }
+
+    if (base.type != VALUE_STRUCT) {
+        fail(state, expression->position,
+             "cannot read field '%s' from %s", expression->name, type_name_of(base));
+        return false;
+    }
+
+    long long index = find_field(base.as.aggregate.decl, expression->name);
+    if (index < 0) {
+        fail(state, expression->position, "'%s' has no field '%s'",
+             base.as.aggregate.decl->node->name, expression->name);
+        return false;
+    }
+
+    *out = base.as.aggregate.fields[index];
+    return true;
+}
+
+/* Field assignment: `a.field = value`.
+ *
+ * The target is stored as an EXPR_FIELD, so evaluating it would yield the
+ * field's current value rather than the struct it belongs to. The struct is
+ * reached through `field->left` instead -- the object the field is read from. */
+/* Field assignment: `a.field = value`.
+ *
+ * The object is read through `field->left` *without copying*, so the write
+ * lands on the variable's own storage. Reading it through the ordinary
+ * identifier path would return a copy, and the assignment would be written into
+ * that copy and then discarded -- `b.x = 99` would leave both `a` and `b`
+ * unchanged, or with a copy-on-read scheme, change both.
+ *
+ * Copying on read is still correct for everything that only reads a struct.
+ */
+static bool assign_field(InterpState *state, const Expr *expression,
+                         Scope *scope, Value value) {
+    const Expr *field = expression->left;
+    if (field == NULL || field->left == NULL) {
+        fail(state, expression->position, "malformed field assignment");
+        return false;
+    }
+
+    /* Only a bare identifier is supported as an assignment target. Anything
+     * deeper (`a.b.x = 1`) needs lvalue tracking that does not exist yet, and
+     * guessing would silently write to the wrong place. */
+    if (field->left->type != EXPR_IDENT) {
+        fail(state, expression->position,
+             "cannot assign to a nested field yet");
+        return false;
+    }
+
+    Value *stored = scope_find(scope, field->left->name);
+    if (stored == NULL) {
+        fail(state, expression->position, "undefined variable '%s'",
+             field->left->name);
+        return false;
+    }
+    if (stored->type != VALUE_STRUCT) {
+        fail(state, expression->position,
+             "cannot assign to a field of %s", type_name_of(*stored));
+        return false;
+    }
+
+    long long index = find_field(stored->as.aggregate.decl, field->name);
+    if (index < 0) {
+        fail(state, expression->position, "'%s' has no field '%s'",
+             stored->as.aggregate.decl->node->name, field->name);
+        return false;
+    }
+
+    /* The declared field type is enforced on assignment as well as on
+     * construction, so a field cannot change type midway through a program. */
+    TypeKind expected = stored->as.aggregate.decl->node->fields[index].type;
+    if (!value_matches_type(value, expected)) {
+        if (value.type == VALUE_INTEGER && value.as.integer.type == TYPE_NUMBER &&
+            integer_fits(value.as.integer.bits, expected)) {
+            value = value_integer(value.as.integer.bits, expected);
+        } else {
+            fail(state, expression->position, "field '%s' expects %s, got %s",
+                 field->name, type_kind_name(expected), type_name_of(value));
+            return false;
+        }
+    }
+
+    stored->as.aggregate.fields[index] = value;
+    return true;
+}
+
 static bool evaluate(InterpState *state, const Expr *expression,
                      Scope *scope, Value *out) {
     if (expression == NULL) {
@@ -962,12 +1399,21 @@ static bool evaluate(InterpState *state, const Expr *expression,
         case EXPR_ASSIGN: {
             Value value;
             if (!evaluate(state, expression->right, scope, &value)) return false;
-            /* A stored variable holds a Number, so the literal form is dropped here.
-             * Terminal.Write(True) prints True; Terminal.Write(x) where
-             * x = True prints 1. */
+
+            if (expression->left != NULL) {
+                /* A field assignment; an OS does this constantly. */
+                if (!assign_field(state, expression, scope, value)) return false;
+                *out = value;
+                return true;
+            }
+
+            /* The literal form is dropped on the way in: a stored variable
+             * holds a Number, so Terminal.Write(True) prints True while
+             * Terminal.Write(x) where x = True prints 1. */
             value = value_as_plain(value);
             if (!scope_assign(scope, expression->name, value)) {
-                fail(state, expression->position, "undefined variable '%s'", expression->name);
+                fail(state, expression->position,
+                     "undefined variable '%s'", expression->name);
                 return false;
             }
             *out = value;
@@ -976,6 +1422,15 @@ static bool evaluate(InterpState *state, const Expr *expression,
 
         case EXPR_BUILTIN:
             return evaluate_builtin(state, expression, scope, out);
+
+        case EXPR_STRUCT_INIT:
+            return evaluate_struct_init(state, expression, scope, out);
+
+        case EXPR_UNION_INIT:
+            return evaluate_union_init(state, expression, scope, out);
+
+        case EXPR_FIELD:
+            return evaluate_field(state, expression, scope, out);
 
         case EXPR_CALL:
             return evaluate_call(state, expression, scope, out);
@@ -1020,7 +1475,25 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                  * to prevent, so `Variable n: Word = -1` must be written with an
                  * explicit conversion. */
                 TypeKind expected = statement->declared_type;
-                if (!value_matches_type(initial, expected)) {
+                if (expected == TYPE_NAMED) {
+                    /* A Struct or Union. Compared by identity against the
+                     * declaration rather than by type name, so two aggregates
+                     * with the same field names are still distinct. */
+                    const Decl *decl = resolve_named(state, statement->type_name);
+                    if (decl == NULL) {
+                        fail(state, statement->position,
+                             "undefined type '%s'", statement->type_name);
+                        return false;
+                    }
+                    if (initial.type != (decl->is_union ? VALUE_UNION : VALUE_STRUCT) ||
+                        initial.as.aggregate.decl != decl) {
+                        fail(state, statement->position,
+                             "cannot initialise '%s' of type %s with %s",
+                             statement->name, statement->type_name,
+                             type_name_of(initial));
+                        return false;
+                    }
+                } else if (!value_matches_type(initial, expected)) {
                     TypeKind given = initial.type == VALUE_INTEGER
                                          ? initial.as.integer.type
                                          : TYPE_NUMBER;
@@ -1045,7 +1518,10 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
                      statement->name);
                 return false;
             }
-            if (!scope_define(scope, statement->name, initial)) {
+            /* Copied, so `Variable b: P = a` does not leave b sharing a's fields.
+             * Structs and unions are value types; without this, assigning a
+             * field through either variable changes both. */
+            if (!scope_define(scope, statement->name, value_copy(initial))) {
                 fail(state, statement->position, "out of memory");
                 return false;
             }
@@ -1123,6 +1599,86 @@ static bool execute_statement(InterpState *state, const Stmt *statement,
             }
             return true;
 
+        case STMT_STRUCT:
+        case STMT_UNION:
+            /* Types are registered in a pre-pass, so reaching the declaration
+             * here means it is a duplicate. */
+            fail(state, statement->position,
+                 "internal error: '%s' registered twice", statement->name);
+            return false;
+
+        case STMT_MATCH: {
+            Value subject;
+            if (!evaluate(state, statement->expression, scope, &subject)) return false;
+
+            if (subject.type != VALUE_UNION) {
+                fail(state, statement->position,
+                     "Match needs a union value, got %s", type_name_of(subject));
+                return false;
+            }
+
+            const Decl *decl = subject.as.aggregate.decl;
+            long long active = subject.as.aggregate.tag;
+
+            /* The declared type name on the Match must match the value's, so a
+             * typo in an arm is an error rather than a dead branch. */
+            if (statement->name != NULL &&
+                strcmp(statement->name, decl->node->name) != 0) {
+                fail(state, statement->position,
+                     "Match arms name '%s' but the value is a '%s'",
+                     statement->name, decl->node->name);
+                return false;
+            }
+
+            for (size_t i = 0; i < statement->arm_count; i++) {
+                const MatchArm *arm = &statement->arms[i];
+                long long index = find_field(decl, arm->variant);
+                if (index < 0) {
+                    fail(state, arm->position, "'%s' has no variant '%s'",
+                         decl->node->name, arm->variant);
+                    return false;
+                }
+                if (index != active) continue;
+
+                /* The matched arm gets its own scope, and the payload is bound
+                 * to the arm's name when it asked for one. */
+                Scope *inner = scope_create(scope);
+                if (inner == NULL) {
+                    fail(state, arm->position, "out of memory");
+                    return false;
+                }
+
+                const Field *variant = &decl->node->fields[index];
+                if (arm->binding != NULL) {
+                    if (!variant->has_payload) {
+                        fail(state, arm->position,
+                             "variant '%s' has no payload to bind to '%s'",
+                             arm->variant, arm->binding);
+                        scope_destroy(inner);
+                        return false;
+                    }
+                    if (!scope_define(inner, arm->binding,
+                                      subject.as.aggregate.fields[index])) {
+                        fail(state, arm->position, "out of memory");
+                        scope_destroy(inner);
+                        return false;
+                    }
+                }
+
+                bool ok = execute_block(state, arm->body, arm->body_count, inner, flow);
+                scope_destroy(inner);
+                return ok;
+            }
+
+            /* No arm matched. Exhaustiveness is checked when the Match is
+             * reached, not just at parse time, so a value built dynamically
+             * still cannot fall through silently. */
+            fail(state, statement->position,
+                 "Match on '%s' is not exhaustive: no arm handles variant '%s'",
+                 decl->node->name, decl->node->fields[active].name);
+            return false;
+        }
+
         case STMT_FUNCTION:
             /* Function declarations are hoisted in a pre-pass before execution
              * (see interp_run), so reaching one here means a duplicate. */
@@ -1156,6 +1712,43 @@ static bool hoist_functions(InterpState *state, const Program *program, Scope *g
     return true;
 }
 
+/* Pass 0: register Struct and Union declarations, so a type may be used
+ * before the line that declares it -- the same rule functions already follow. */
+static bool register_decl(InterpState *state, const Stmt *node) {
+    const Decl *existing = find_decl(state, node->name);
+    if (existing != NULL) {
+        fail(state, node->position, "'%s' is already declared", node->name);
+        return false;
+    }
+
+    if (state->decl_count + 1 > state->decl_capacity) {
+        size_t capacity = state->decl_capacity ? state->decl_capacity * 2 : 8;
+        Decl *grown = realloc(state->decls, capacity * sizeof(Decl));
+        if (grown == NULL) {
+            fail(state, node->position, "out of memory");
+            return false;
+        }
+        state->decls = grown;
+        state->decl_capacity = capacity;
+    }
+
+    state->decls[state->decl_count].node = node;
+    state->decls[state->decl_count].is_union = (node->type == STMT_UNION);
+    state->decl_count++;
+    return true;
+}
+
+static bool hoist_decls(InterpState *state, const Program *program) {
+    for (size_t i = 0; i < program->count; i++) {
+        const Stmt *statement = program->statements[i];
+        if (statement->type != STMT_STRUCT && statement->type != STMT_UNION) {
+            continue;
+        }
+        if (!register_decl(state, statement)) return false;
+    }
+    return true;
+}
+
 int interp_run(const Program *program, Interp *interp) {
     InterpState state = {0};
     state.program = program;
@@ -1166,10 +1759,15 @@ int interp_run(const Program *program, Interp *interp) {
         return 1;
     }
 
-    if (hoist_functions(&state, program, state.global_scope)) {
+    if (hoist_decls(&state, program) && hoist_functions(&state, program, state.global_scope)) {
         for (size_t i = 0; i < program->count; i++) {
             const Stmt *statement = program->statements[i];
-            if (statement->type == STMT_FUNCTION) continue;
+            /* Declarations were handled by the pre-passes. */
+            if (statement->type == STMT_FUNCTION ||
+                statement->type == STMT_STRUCT ||
+                statement->type == STMT_UNION) {
+                continue;
+            }
 
             Flow flow = {0};
             if (!execute_statement(&state, statement, state.global_scope, &flow)) break;

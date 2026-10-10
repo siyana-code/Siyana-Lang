@@ -28,6 +28,7 @@ static const char *const kTypeNames[] = {
     "If", "Else", "Loop", "Return",
     "True", "False",
     "Terminal", "Write", "ReadLine",
+    "Struct", "Union", "Error", "Match",
     "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
     "'<'", "'<='", "'>'", "'>='"
@@ -128,6 +129,8 @@ static TokenType keyword_type(const char *text, size_t length) {
         {"True", TOKEN_TRUE},            {"False", TOKEN_FALSE},
         {"Terminal", TOKEN_TERMINAL},    {"Write", TOKEN_WRITE},
         {"ReadLine", TOKEN_READ_LINE},
+        {"Struct", TOKEN_STRUCT}, {"Union", TOKEN_UNION},
+        {"Error", TOKEN_ERROR}, {"Match", TOKEN_MATCH},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strlen(table[i].word) == length &&
@@ -156,9 +159,16 @@ static void scan_identifier(Lexer *lexer, TokenList *list) {
     token->start_offset = start_offset;
     token->length = length;
 
-    /* Identifiers carry owned text so the parser never needs access to the
-     * source buffer. String tokens do the same. */
-    if (type == TOKEN_IDENT) {
+    /* Any token that can serve as a name carries owned text, so the parser never
+     * needs access to the source buffer.
+     *
+     * This includes the type keywords: `Union V { Number(Number), }` uses
+     * `Number` as a variant name, which is allowed by is_name_token. Restricting
+     * it to TOKEN_IDENT left those tokens with a NULL text pointer, and
+     * copy_ident then copied from NULL. */
+    if (type == TOKEN_IDENT || type == TOKEN_NUMBER_TYPE ||
+        type == TOKEN_NUMBER32_TYPE || type == TOKEN_WORD_TYPE ||
+        type == TOKEN_CHARACTER_TYPE) {
         token->text = malloc(length + 1);
         if (token->text == NULL) return;
         memcpy(token->text, lexer->source + start_offset, length);
@@ -349,7 +359,7 @@ static void scan_token(Lexer *lexer, TokenList *list) {
     size_t start_offset = lexer->offset;
     char c = advance(lexer);
 
-    TokenType type = TOKEN_ERROR;
+    TokenType type = TOKEN_LEX_ERROR;
 
     if (c == '\0' && is_at_end(lexer)) {
         type = TOKEN_EOF;

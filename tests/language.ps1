@@ -312,7 +312,9 @@ Test-Case 'wrong argument type is an error' {
     Test-Diagnostic "Function F(a: Number) { } F('c');" "parameter 'a'.*expects Number"
 }
 Test-Case 'unknown type is an error' {
-    Test-Diagnostic 'Variable x: Widget = 1;' "expected type 'Number', 'Number32', 'Word', or 'Character'"
+    # A named type resolves at run time, so an undeclared one is reported when
+    # the declaration is reached rather than at parse time.
+    Test-Diagnostic 'Variable x: Widget = 1;' "undefined type 'Widget'"
 }
 
 # --- Integer widths ---------------------------------------------------------
@@ -366,6 +368,232 @@ Test-Case 'Word arithmetic works' {
 Test-Case 'Word comparison is unsigned' {
     # Signed comparison would make 0-1 appear less than any positive value.
     Test-Output 'Variable w: Word = 4294967295; Terminal.Write(w > 1);' @('True')
+}
+
+# --- Structs ----------------------------------------------------------------
+
+Test-Case 'a struct field can be read' {
+    $src = @'
+Struct Point {
+    x: Number32,
+    y: Number32,
+}
+Variable p: Point = Point { x: 3, y: 4 };
+Terminal.Write(p.x);
+Terminal.Write(p.y);
+'@
+    Test-Output $src @('3', '4')
+}
+Test-Case 'field order in a literal does not matter' {
+    Test-Output 'Struct P { a: Number32, b: Number32, } Variable p: P = P { b: 2, a: 1 }; Terminal.Write(p);' @('P {a: 1, b: 2}')
+}
+Test-Case 'a struct field can be assigned' {
+    Test-Output 'Struct P { a: Number32, } Variable p: P = P { a: 1 }; p.a = 9; Terminal.Write(p.a);' @('9')
+}
+Test-Case 'a struct copies on assignment' {
+    # The aliasing bug this guards: `b` must not share `a`'s storage, or writing
+    # through one variable silently changes the other.
+    $src = @'
+Struct P { a: Number32, }
+Variable a: P = P { a: 1 };
+Variable b: P = a;
+b.a = 99;
+Terminal.Write(a.a);
+Terminal.Write(b.a);
+'@
+    Test-Output $src @('1', '99')
+}
+Test-Case 'a struct passes to a function by value' {
+    $src = @'
+Struct P { a: Number32, }
+Function Bump(p: P) {
+    p.a = 42;
+}
+Variable p: P = P { a: 1 };
+Bump(p);
+Terminal.Write(p.a);
+'@
+    Test-Output $src @('1')
+}
+Test-Case 'a literal must set every field' {
+    # Nothing-as-placeholder hides the bug until much later, so a partial
+    # literal is rejected outright.
+    Test-Diagnostic 'Struct P { a: Number32, b: Number32, } Variable p: P = P { a: 1 };' "missing a value for field 'b'"
+}
+Test-Case 'an unknown field is an error' {
+    Test-Diagnostic 'Struct P { a: Number32, } Variable p: P = P { a: 1, c: 2 };' "has no field 'c'"
+}
+Test-Case 'setting a field twice is an error' {
+    Test-Diagnostic 'Struct P { a: Number32, } Variable p: P = P { a: 1, a: 2 };' "field 'a' is set twice"
+}
+Test-Case 'a field keeps its declared type' {
+    Test-Diagnostic 'Struct P { a: Word, } Variable p: P = P { a: -1 };' "field 'a' of 'P' expects Word"
+}
+Test-Case 'a duplicate struct name is an error' {
+    Test-Diagnostic 'Struct P { a: Number32, } Struct P { b: Number32, }' "already declared"
+}
+Test-Case 'a duplicate field name is an error' {
+    Test-Diagnostic 'Struct P { a: Number32, a: Word, }' "declared twice"
+}
+Test-Case 'a struct may be declared after its use' {
+    # Declarations are hoisted, so a type may be used above the line that
+    # defines it -- the same rule functions already follow.
+    Test-Output 'Variable p: Point = Point { x: 1 }; Struct Point { x: Number32, } Terminal.Write(p.x);' @('1')
+}
+
+# --- Tagged unions ----------------------------------------------------------
+
+Test-Case 'a union holds one variant' {
+    $src = @'
+Union Value {
+    Nothing,
+    Number(Number),
+}
+Variable v: Value = Value.Number(42);
+Terminal.Write(v);
+'@
+    Test-Output $src @('Value.Number(42)')
+}
+Test-Case 'a payload-less variant needs no argument' {
+    Test-Output 'Union V { Nothing, } Variable v: V = V.Nothing; Terminal.Write(v);' @('V.Nothing')
+}
+Test-Case 'Match selects the active arm' {
+    $src = @'
+Union Value {
+    Nothing,
+    Number(Number),
+    Flag(Number),
+}
+Function Describe(v: Value) {
+    Match v {
+        Value.Nothing { Terminal.Write("nothing"); }
+        Value.Number(n) { Terminal.Write("number ", n); }
+        Value.Flag(f) { Terminal.Write("flag ", f); }
+    }
+}
+Describe(Value.Nothing);
+Describe(Value.Number(7));
+Describe(Value.Flag(1));
+'@
+    Test-Output $src @('nothing', 'number 7', 'flag 1')
+}
+Test-Case 'a union may be named after a type keyword' {
+    # `Number(Number)` is the natural spelling, so the lexer must give type
+    # keywords owned text and the parser must accept them as names.
+    Test-Output 'Union V { Number(Number), } Variable v: V = V.Number(1); Terminal.Write(v);' @('V.Number(1)')
+}
+Test-Case 'an unhandled variant is an error, not a fall-through' {
+    # Exhaustiveness checked when the Match is reached, so a value built
+    # dynamically still cannot escape.
+    $src = @'
+Union V {
+    A,
+    B,
+}
+Variable v: V = V.B;
+Match v {
+    V.A { Terminal.Write("a"); }
+}
+'@
+    Test-Diagnostic $src "not exhaustive"
+}
+Test-Case 'Match needs a union' {
+    Test-Diagnostic 'Union V { A, } Match 1 { V.A { } }' 'Match needs a union'
+}
+Test-Case 'Match arms must name one type' {
+    Test-Diagnostic 'Union V { A, } Union W { B, } Variable v: V = V.A; Match v { V.A { } W.B { } }' 'must all name the same type'
+}
+Test-Case 'a union field cannot be read directly' {
+    # The active variant decides what a field means, so a read would be a guess.
+    Test-Diagnostic 'Union V { Number(Number), } Variable v: V = V.Number(1); Terminal.Write(v.Number);' 'use Match'
+}
+Test-Case 'a variant payload is type checked' {
+    Test-Diagnostic 'Union V { Count(Word), } Variable v: V = V.Count(-1);' "variant 'Count' of 'V' expects Word"
+}
+Test-Case 'a payload-less variant rejects a payload' {
+    Test-Diagnostic 'Union V { A, B(Number), } Variable v: V = V.A(1);' 'takes no payload'
+}
+Test-Case 'a payload variant requires a payload' {
+    Test-Diagnostic 'Union V { A, B(Number), } Variable v: V = V.B;' 'needs a payload'
+}
+Test-Case 'an unknown variant is an error' {
+    Test-Diagnostic 'Union V { A, } Variable v: V = V.Missing;' "has no variant 'Missing'"
+}
+Test-Case 'a struct has no variants' {
+    Test-Diagnostic 'Struct P { a: Number32, } Variable v: P = P.A;' "is a struct"
+}
+Test-Case 'a union is not built with a struct literal' {
+    Test-Diagnostic 'Union V { A, } Variable v: V = V { a: 1 };' "construct it with"
+}
+Test-Case 'a duplicate variant name is an error' {
+    Test-Diagnostic 'Union V { A, A, }' "declared twice"
+}
+Test-Case 'an empty declaration is an error' {
+    Test-Diagnostic 'Struct P { }' 'at least one field'
+}
+
+# --- Blocks are not struct literals ----------------------------------------
+#
+# `If (x) { }` puts an identifier directly in front of a brace, which is the
+# same shape as `Type { field: value }`. The parser resolves this by context,
+# so every place a brace follows an identifier needs a test -- an earlier
+# version broke If and Loop while every existing test still passed, because
+# they all used literal conditions.
+
+Test-Case 'If on a named variable is not a struct literal' {
+    Test-Output 'Variable one: Number = 1; If (one) { Terminal.Write("yes"); }' @('yes')
+}
+Test-Case 'Loop on a named variable is not a struct literal' {
+    $src = @'
+Variable n: Number = 3;
+Variable total: Number = 0;
+Loop (n) {
+    total = total + 1;
+    n = n - 1;
+}
+Terminal.Write(total);
+'@
+    Test-Output $src @('3')
+}
+Test-Case 'Else If on a named variable is not a struct literal' {
+    $src = @'
+Variable n: Number = 2;
+If (n == 1) {
+    Terminal.Write("one");
+} Else If (n == 2) {
+    Terminal.Write("two");
+} Else {
+    Terminal.Write("many");
+}
+'@
+    Test-Output $src @('two')
+}
+Test-Case 'Match on a named variable is not a struct literal' {
+    $src = @'
+Union V { A, B, }
+Variable v: V = V.B;
+Match v {
+    V.A { Terminal.Write("a"); }
+    V.B { Terminal.Write("b"); }
+}
+'@
+    Test-Output $src @('b')
+}
+Test-Case 'a struct literal still works in a call argument' {
+    # The guard is scoped to the condition, not global: an argument position
+    # has no block to confuse it with.
+    Test-Output 'Struct P { a: Number32, } Function Show(p: P) { Terminal.Write(p.a); } Show(P { a: 7 });' @('7')
+}
+Test-Case 'a union construction still works in a call argument' {
+    Test-Output 'Union V { A, B(Number), } Function Show(v: V) { Match v { V.A { Terminal.Write("a"); } V.B(n) { Terminal.Write(n); } } } Show(V.B(8));' @('8')
+}
+
+# --- Error declarations -----------------------------------------------------
+
+Test-Case 'Error declares a payload-less union' {
+    # Same machinery as Union, so Error sets can be declared before any
+    # fallible function exists.
+    Test-Output 'Error Io { NotFound, Denied, } Terminal.Write("declared");' @('declared')
 }
 
 # --- Comments ---------------------------------------------------------------

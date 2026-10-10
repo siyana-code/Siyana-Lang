@@ -41,6 +41,19 @@ typedef struct {
 
     Program *program;
 
+    /* Set while parsing a position where a `{` opens a block rather than a
+     * struct literal: an If or Loop condition, and a Match subject and body.
+     *
+     * This is a real ambiguity, not a workaround. `If (x) { ... }` and
+     * `Match v { V.A { ... } }` both put an identifier directly in front of a
+     * brace, which is exactly the shape of `Type { field: value }`. Without the
+     * flag, `If (one) { ... }` parses `one { Terminal.Write(...) }` as a struct
+     * literal and reports a field name it never saw.
+     *
+     * A struct literal is only meaningful when the identifier names a type, and
+     * that is not knowable here. The context is the only signal available. */
+    bool suppress_struct_literal;
+
     bool failed;
     char message[160];
     Position error_position;
@@ -49,6 +62,10 @@ typedef struct {
 static Stmt *parse_statement(Parser *parser);
 static Expr *parse_expression(Parser *parser);
 static Expr *parse_assignment(Parser *parser);
+
+/* Defined next to the aggregate declarations, but needed by parse_postfix
+ * above them: a field or variant may be named after a type keyword. */
+static bool is_name_token(TokenType type);
 
 static void fail(Parser *parser, Position position, const char *fmt, ...) {
     if (parser->failed) return;
@@ -105,6 +122,12 @@ static char *copy_ident(const Token *token) {
     return copy_text(token->text, token->length);
 }
 
+/* Non-owning view of a token's text, for comparisons only. Valid while the
+ * token array lives, which for the parser is the whole parse. */
+static const char *token_text_of(const Token *token) {
+    return token->text;
+}
+
 /* --- Node constructors ---------------------------------------------------- */
 
 static Stmt *stmt_new(Parser *parser, NodeType type, Position position) {
@@ -151,6 +174,19 @@ static void stmt_free(Stmt *stmt) {
     expr_free(stmt->initializer);
     stmt_free(stmt->else_branch);
 
+    for (size_t i = 0; i < stmt->field_count; i++) free(stmt->fields[i].name);
+    free(stmt->fields);
+
+    for (size_t i = 0; i < stmt->arm_count; i++) {
+        free(stmt->arms[i].variant);
+        free(stmt->arms[i].binding);
+        for (size_t j = 0; j < stmt->arms[i].body_count; j++) {
+            stmt_free(stmt->arms[i].body[j]);
+        }
+        free(stmt->arms[i].body);
+    }
+    free(stmt->arms);
+
     for (size_t i = 0; i < stmt->body_count; i++) stmt_free(stmt->body[i]);
     free(stmt->body);
 
@@ -179,7 +215,14 @@ void program_free(Program *program) {
 
 /* --- Types ---------------------------------------------------------------- */
 
-static bool parse_type(Parser *parser, TypeKind *out_type) {
+/* Parses a type annotation.
+ *
+ * Only the built-in integer types are accepted here. Struct and union names
+ * are also types, but they are resolved at run time rather than at parse time:
+ * the parser has no symbol table, and a declaration may appear after its use.
+ * A named type in a `Variable x: Foo` annotation is therefore accepted as a
+ * special case below and checked when the declaration runs. */
+static bool parse_type(Parser *parser, TypeKind *out_type, char **out_named) {
     if (match(parser, TOKEN_NUMBER_TYPE)) {
         *out_type = TYPE_NUMBER;
         return true;
@@ -196,8 +239,19 @@ static bool parse_type(Parser *parser, TypeKind *out_type) {
         *out_type = TYPE_CHARACTER;
         return true;
     }
+
+    /* A named type: `Variable p: Point`. Recorded as TYPE_NAMED, with the name
+     * in `out_named`; `out_type` is set to TYPE_NAMED so the caller knows to
+     * defer the check. */
+    if (check(parser, TOKEN_IDENT)) {
+        if (out_named != NULL) *out_named = copy_ident(current(parser));
+        advance_token(parser);
+        if (out_type != NULL) *out_type = TYPE_NAMED;
+        return true;
+    }
+
     fail(parser, current(parser)->start,
-         "expected type 'Number', 'Number32', 'Word', or 'Character', found %s",
+         "expected a type name, found %s",
          token_type_description(current(parser)->type));
     return false;
 }
@@ -231,19 +285,36 @@ static Expr *parse_primary(Parser *parser) {
             return NULL;
         }
 
+        /* Terminal.Write is variadic; Terminal.ReadLine takes none. Both forms are
+         * accepted here and the arity is checked at run time, which keeps the
+         * grammar identical for every builtin. */
         if (!check(parser, TOKEN_RPAREN)) {
-            call->arguments = malloc(sizeof(Expr *));
+            size_t capacity = 4;
+            call->arguments = malloc(capacity * sizeof(Expr *));
             if (call->arguments == NULL) {
                 fail(parser, token->start, "out of memory");
                 expr_free(call);
                 return NULL;
             }
-            call->argument_count = 1;
-            call->arguments[0] = parse_expression(parser);
-            if (parser->failed) {
-                expr_free(call);
-                return NULL;
-            }
+
+            do {
+                if (call->argument_count + 1 > capacity) {
+                    capacity *= 2;
+                    Expr **grown = realloc(call->arguments, capacity * sizeof(Expr *));
+                    if (grown == NULL) {
+                        fail(parser, token->start, "out of memory");
+                        expr_free(call);
+                        return NULL;
+                    }
+                    call->arguments = grown;
+                }
+                Expr *argument = parse_expression(parser);
+                if (parser->failed) {
+                    expr_free(call);
+                    return NULL;
+                }
+                call->arguments[call->argument_count++] = argument;
+            } while (match(parser, TOKEN_COMMA));
         }
 
         if (!consume(parser, TOKEN_RPAREN, "closing ')'")) {
@@ -305,11 +376,179 @@ static Expr *parse_primary(Parser *parser) {
          token_type_description(token->type));
     return NULL;
 }
+
+/* --- Postfix: field access, struct literals, union construction ------------ */
+
+/* Handles `expr.field`, `Type { field: value, ... }`, and `Type.Variant(...)`.
+ *
+ * These are all postfix: they attach to whatever expression precedes them, so
+ * they sit below assignment in the precedence chain and are reached from
+ * parse_call. */
 /* --- Call, unary, and the precedence climbing levels ------------------------ */
+
+/* --- Postfix: field access, struct literals, union construction ------------ */
+
+/* Handles `expr.field`, `Type { field: value, ... }`, and `Type.Variant(...)`.
+ *
+ * These are all postfix -- they attach to whatever expression precedes them --
+ * so they sit above calls in the precedence chain and are reached from
+ * parse_call.
+ *
+ * Note a genuine ambiguity: `P.x` is a field read when P is a variable and a
+ * union constructor when P is a union type. No syntactic lookahead can tell
+ * them apart, because both forms are `IDENT . IDENT`. This was handled by
+ * guessing here and was wrong -- it made every `p.field` a constructor attempt.
+ * Now both cases produce one node and the interpreter decides from the declared
+ * types, which is the only place the answer actually exists. */
+static Expr *parse_postfix(Parser *parser, Expr *base) {
+    if (parser->failed || base == NULL) return NULL;
+
+    /* `Name.Variant` with an optional parenthesised payload: a union
+     * construction when Name is a union type, a field read otherwise.
+     *
+     * is_name_token rather than TOKEN_IDENT because a variant may be named
+     * after a type keyword -- `Value.Number(42)` is the natural spelling. */
+    if (base->type == EXPR_IDENT && check(parser, TOKEN_DOT) &&
+        is_name_token(parser->tokens[parser->position + 1].type)) {
+        advance_token(parser); /* '.' */
+        const Token *member = advance_token(parser);
+
+        Expr *access = expr_new(parser, EXPR_FIELD, member->start);
+        if (access == NULL) return NULL;
+        access->left = base;
+        access->name = copy_ident(member);
+
+        /* A '(' turns it into a construction, which is how a union variant with
+         * a payload is written. */
+        if (match(parser, TOKEN_LPAREN)) {
+            access->payload = parse_expression(parser);
+            if (parser->failed) {
+                expr_free(access);
+                return NULL;
+            }
+            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a variant payload")) {
+                expr_free(access);
+                return NULL;
+            }
+        }
+
+        return parse_postfix(parser, access);
+    }
+
+    /* `expr.field` */
+    if (match(parser, TOKEN_DOT)) {
+        if (!check(parser, TOKEN_IDENT)) {
+            fail(parser, current(parser)->start,
+                 "expected a field name after '.', found %s",
+                 token_type_description(current(parser)->type));
+            return NULL;
+        }
+        const Token *member = advance_token(parser);
+
+        Expr *access = expr_new(parser, EXPR_FIELD, member->start);
+        if (access == NULL) return NULL;
+        access->left = base;
+        access->name = copy_ident(member);
+        return parse_postfix(parser, access);
+    }
+
+    /* `Type { field: value, ... }` -- a struct literal.
+     *
+     * Suppressed inside a Match arm, where `V.A { ... }` would otherwise be
+     * read as a literal of a type named `V` with a field named `A`. */
+    if (check(parser, TOKEN_LBRACE) && base->type == EXPR_IDENT &&
+        !parser->suppress_struct_literal) {
+        Expr *literal = expr_new(parser, EXPR_STRUCT_INIT, base->position);
+        if (literal == NULL) return NULL;
+        literal->name = base->name;
+        base->name = NULL;
+        expr_free(base);
+
+        advance_token(parser); /* '{' */
+
+        size_t capacity = 4;
+        literal->arguments = malloc(capacity * sizeof(Expr *));
+        if (literal->arguments == NULL) {
+            fail(parser, literal->position, "out of memory");
+            expr_free(literal);
+            return NULL;
+        }
+
+        while (!check(parser, TOKEN_RBRACE)) {
+            if (check(parser, TOKEN_EOF)) {
+                fail(parser, literal->position, "unclosed '{' -- missing '}'");
+                expr_free(literal);
+                return NULL;
+            }
+            if (!check(parser, TOKEN_IDENT)) {
+                fail(parser, current(parser)->start,
+                     "expected a field name, found %s",
+                     token_type_description(current(parser)->type));
+                expr_free(literal);
+                return NULL;
+            }
+            const Token *field_name = advance_token(parser);
+            if (!consume(parser, TOKEN_COLON, "':' after a field name")) {
+                expr_free(literal);
+                return NULL;
+            }
+
+            /* Each field is an EXPR_ASSIGN, so the name travels with its
+             * value and order does not matter at the call site. */
+            Expr *field = expr_new(parser, EXPR_ASSIGN, field_name->start);
+            if (field == NULL) {
+                expr_free(literal);
+                return NULL;
+            }
+            field->name = copy_ident(field_name);
+            field->right = parse_expression(parser);
+            if (parser->failed) {
+                expr_free(field);
+                expr_free(literal);
+                return NULL;
+            }
+
+            if (literal->argument_count + 1 > capacity) {
+                capacity *= 2;
+                Expr **grown = realloc(literal->arguments, capacity * sizeof(Expr *));
+                if (grown == NULL) {
+                    expr_free(field);
+                    expr_free(literal);
+                    fail(parser, literal->position, "out of memory");
+                    return NULL;
+                }
+                literal->arguments = grown;
+            }
+            literal->arguments[literal->argument_count++] = field;
+
+            if (!match(parser, TOKEN_COMMA)) break;
+        }
+
+        if (!consume(parser, TOKEN_RBRACE, "closing '}' of a struct literal")) {
+            expr_free(literal);
+            return NULL;
+        }
+        if (literal->argument_count == 0) {
+            fail(parser, literal->position, "struct literal must set at least one field");
+            expr_free(literal);
+            return NULL;
+        }
+
+        return parse_postfix(parser, literal);
+    }
+
+    return base;
+}
+
 
 static Expr *parse_call(Parser *parser) {
     Position start = current(parser)->start;
     Expr *callee = parse_primary(parser);
+    if (parser->failed) return NULL;
+    /* Postfix forms attach after a primary, so `Type { ... }` and `a.field`
+     * are handled here. parse_postfix returns the base unchanged when neither
+     * a dot nor a literal brace follows, which is the common case. */
+    callee = parse_postfix(parser, callee);
     if (parser->failed) return NULL;
 
     if (!check(parser, TOKEN_LPAREN)) return callee;
@@ -356,6 +595,16 @@ static Expr *parse_call(Parser *parser) {
                 expr_free(call);
                 return NULL;
             }
+            /* Through the postfix chain, so that a union construction or a
+             * struct literal parses as an argument: `f(Value.Number(2))` and
+             * `f(Point { x: 1 })` both start with an identifier followed by a
+             * dot or a brace, which parse_expression alone does not consume. */
+            argument = parse_postfix(parser, argument);
+            if (parser->failed) {
+                expr_free(argument);
+                expr_free(call);
+                return NULL;
+            }
             call->arguments[call->argument_count++] = argument;
         } while (match(parser, TOKEN_COMMA));
     }
@@ -364,7 +613,7 @@ static Expr *parse_call(Parser *parser) {
         expr_free(call);
         return NULL;
     }
-    return call;
+    return parse_postfix(parser, call);
 }
 
 static Expr *parse_unary(Parser *parser) {
@@ -462,24 +711,83 @@ static Expr *parse_equality(Parser *parser) {
     return parse_binary(parser, level, sizeof(level) / sizeof(level[0]), parse_comparison);
 }
 
-/* Assignment is right-associative: `a = b = 1` assigns 1 to b then to a. */
+/* Assignment is right-associative: `a = b = 1` assigns 1 to b then to a.
+ *
+ * Two forms. A bare identifier assigns to a variable; an EXPR_FIELD assigns to
+ * a struct field. Both are represented by EXPR_ASSIGN, distinguished by
+ * whether `left` is set. */
 static Expr *parse_assignment(Parser *parser) {
-    if (check(parser, TOKEN_IDENT) &&
-        parser->tokens[parser->position + 1].type == TOKEN_ASSIGN) {
-        Position start = current(parser)->start;
-        const Token *name = advance_token(parser);
-        advance_token(parser); /* '=' */
+    if (check(parser, TOKEN_IDENT)) {
+        /* `ident = ...` */
+        if (parser->tokens[parser->position + 1].type == TOKEN_ASSIGN) {
+            Position start = current(parser)->start;
+            const Token *name = advance_token(parser);
+            advance_token(parser); /* '=' */
 
-        Expr *node = expr_new(parser, EXPR_ASSIGN, start);
-        if (node == NULL) return NULL;
-        node->name = copy_ident(name);
-        node->right = parse_assignment(parser);
-        if (parser->failed) {
-            expr_free(node);
-            return NULL;
+            Expr *node = expr_new(parser, EXPR_ASSIGN, start);
+            if (node == NULL) return NULL;
+            node->name = copy_ident(name);
+            node->right = parse_assignment(parser);
+            if (parser->failed) {
+                expr_free(node);
+                return NULL;
+            }
+            return node;
         }
-        return node;
+
+        /* `ident.field = ...` -- build the field access, then assign to it. The
+         * dot is known to be there, so the target is parsed directly rather
+         * than speculatively through the postfix chain. */
+        /* The lookahead must confirm the whole shape `ident . ident =`. Checking only
+         * for a dot would swallow `V.A` in `Variable v: V = V.A;` and mistake the
+         * union construction for a field assignment target. */
+        if (parser->tokens[parser->position + 1].type == TOKEN_DOT &&
+            parser->tokens[parser->position + 2].type == TOKEN_IDENT &&
+            parser->tokens[parser->position + 3].type == TOKEN_ASSIGN) {
+            Position start = current(parser)->start;
+            const Token *object = advance_token(parser);
+            advance_token(parser); /* '.' */
+
+            if (!check(parser, TOKEN_IDENT)) {
+                fail(parser, current(parser)->start,
+                     "expected a field name after '.', found %s",
+                     token_type_description(current(parser)->type));
+                return NULL;
+            }
+            const Token *member = advance_token(parser);
+
+            Expr *node = expr_new(parser, EXPR_ASSIGN, start);
+            if (node == NULL) return NULL;
+
+            Expr *base = expr_new(parser, EXPR_IDENT, object->start);
+            if (base == NULL) {
+                expr_free(node);
+                return NULL;
+            }
+            base->name = copy_ident(object);
+
+            node->left = expr_new(parser, EXPR_FIELD, member->start);
+            if (node->left == NULL) {
+                expr_free(base);
+                expr_free(node);
+                return NULL;
+            }
+            node->left->left = base;
+            node->left->name = copy_ident(member);
+
+            if (!consume(parser, TOKEN_ASSIGN, "'=' after a field name")) {
+                expr_free(node);
+                return NULL;
+            }
+            node->right = parse_assignment(parser);
+            if (parser->failed) {
+                expr_free(node);
+                return NULL;
+            }
+            return node;
+        }
     }
+
     return parse_equality(parser);
 }
 
@@ -550,7 +858,7 @@ static Stmt *parse_variable_declaration(Parser *parser) {
     stmt->name = copy_ident(name);
 
     if (!consume(parser, TOKEN_COLON, "':' after variable name") ||
-        !parse_type(parser, &stmt->declared_type)) {
+        !parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
         stmt_free(stmt);
         return NULL;
     }
@@ -623,7 +931,7 @@ static Stmt *parse_function_declaration(Parser *parser) {
             parameter->position = parameter_name->start;
 
             if (!consume(parser, TOKEN_COLON, "':' after parameter name") ||
-                !parse_type(parser, &parameter->type)) {
+                !parse_type(parser, &parameter->type, &parameter->type_name)) {
                 stmt_free(stmt);
                 return NULL;
             }
@@ -643,7 +951,7 @@ static Stmt *parse_function_declaration(Parser *parser) {
             stmt_free(stmt);
             return NULL;
         }
-        if (!parse_type(parser, &stmt->declared_type)) {
+        if (!parse_type(parser, &stmt->declared_type, &stmt->type_name)) {
             stmt_free(stmt);
             return NULL;
         }
@@ -664,7 +972,10 @@ static Stmt *parse_if(Parser *parser) {
     Stmt *stmt = stmt_new(parser, STMT_IF, start);
     if (stmt == NULL) return NULL;
 
+    /* The '{' after the condition opens the body, not a struct literal. */
+    parser->suppress_struct_literal = true;
     stmt->expression = parse_expression(parser);
+    parser->suppress_struct_literal = false;
     if (parser->failed) {
         stmt_free(stmt);
         return NULL;
@@ -706,7 +1017,10 @@ static Stmt *parse_loop(Parser *parser) {
     Stmt *stmt = stmt_new(parser, STMT_LOOP, start);
     if (stmt == NULL) return NULL;
 
+    /* As with If: the '{' opens the body. */
+    parser->suppress_struct_literal = true;
     stmt->expression = parse_expression(parser);
+    parser->suppress_struct_literal = false;
     if (parser->failed) {
         stmt_free(stmt);
         return NULL;
@@ -719,12 +1033,299 @@ static Stmt *parse_loop(Parser *parser) {
     return stmt;
 }
 
+/* --- Aggregate declarations ------------------------------------------------ */
+
+/* Shared by Struct, Union, and Error. All three are `Name { ... }`, differing
+ * only in what a field means: a struct field is `name: Type`, while a union
+ * variant is either a bare `Name` or `Name(Type)`. */
+/* True when the token may be used as a field or variant name.
+ *
+ * Type keywords are allowed here even though they cannot be identifiers
+ * elsewhere: `Number(Number)` is the natural way to name a union variant, and
+ * forbidding it would force every such union to pick a contrived name. The
+ * keyword table gives these tokens their own text, so the name survives. */
+static bool is_name_token(TokenType type) {
+    switch (type) {
+        case TOKEN_IDENT:
+        case TOKEN_NUMBER_TYPE:
+        case TOKEN_NUMBER32_TYPE:
+        case TOKEN_WORD_TYPE:
+        case TOKEN_CHARACTER_TYPE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+
+static Stmt *parse_aggregate(Parser *parser, DeclKind kind, TokenType keyword) {
+    Position start = current(parser)->start;
+    advance_token(parser); /* Struct / Union / Error */
+
+    if (!check(parser, TOKEN_IDENT)) {
+        fail(parser, current(parser)->start,
+             "expected a name after '%s', found %s", token_type_name(keyword),
+             token_type_description(current(parser)->type));
+        return NULL;
+    }
+    const Token *name = advance_token(parser);
+
+    Stmt *stmt = stmt_new(parser,
+                          (kind == DECL_STRUCT) ? STMT_STRUCT : STMT_UNION, start);
+    if (stmt == NULL) return NULL;
+    stmt->decl_kind = kind;
+    stmt->name = copy_ident(name);
+
+    if (!consume(parser, TOKEN_LBRACE, "'{'")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    size_t capacity = 4;
+    stmt->fields = malloc(capacity * sizeof(Field));
+    if (stmt->fields == NULL) {
+        stmt_free(stmt);
+        fail(parser, start, "out of memory");
+        return NULL;
+    }
+
+    while (!check(parser, TOKEN_RBRACE)) {
+        if (check(parser, TOKEN_EOF)) {
+            fail(parser, start, "unclosed '{' -- missing '}'");
+            stmt_free(stmt);
+            return NULL;
+        }
+
+        if (!is_name_token(current(parser)->type)) {
+            fail(parser, current(parser)->start,
+                 "expected a field or variant name, found %s",
+                 token_type_description(current(parser)->type));
+            stmt_free(stmt);
+            return NULL;
+        }
+        const Token *field_name = advance_token(parser);
+
+        if (stmt->field_count + 1 > capacity) {
+            capacity *= 2;
+            Field *grown = realloc(stmt->fields, capacity * sizeof(Field));
+            if (grown == NULL) {
+                stmt_free(stmt);
+                fail(parser, start, "out of memory");
+                return NULL;
+            }
+            stmt->fields = grown;
+        }
+
+        Field *field = &stmt->fields[stmt->field_count];
+        memset(field, 0, sizeof(*field));
+        field->name = copy_ident(field_name);
+        field->position = field_name->start;
+        field->type = TYPE_NUMBER; /* placeholder; not meaningful without a payload */
+        stmt->field_count++;
+
+        if (kind == DECL_STRUCT) {
+            if (!consume(parser, TOKEN_COLON, "':' after a struct field name") ||
+                !parse_type(parser, &field->type, NULL)) {
+                stmt_free(stmt);
+                return NULL;
+            }
+        } else if (match(parser, TOKEN_LPAREN)) {
+            /* A union variant with a payload: Name(Type). */
+            field->has_payload = true;
+            if (!parse_type(parser, &field->type, NULL)) {
+                stmt_free(stmt);
+                return NULL;
+            }
+            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a variant payload type")) {
+                stmt_free(stmt);
+                return NULL;
+            }
+        }
+
+        if (!match(parser, TOKEN_COMMA)) break;
+    }
+
+    if (!consume(parser, TOKEN_RBRACE, "closing '}'")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    /* A trailing comma before '}' is common and harmless; the loop above
+     * handles it by breaking out, so nothing more is needed here. */
+
+    if (stmt->field_count == 0) {
+        fail(parser, start, "'%s' must declare at least one field", stmt->name);
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    /* Duplicate field names would make construction ambiguous. */
+    for (size_t i = 0; i < stmt->field_count; i++) {
+        for (size_t j = i + 1; j < stmt->field_count; j++) {
+            if (strcmp(stmt->fields[i].name, stmt->fields[j].name) == 0) {
+                fail(parser, stmt->fields[j].position,
+                     "'%s' is declared twice in '%s'", stmt->fields[j].name, stmt->name);
+                stmt_free(stmt);
+                return NULL;
+            }
+        }
+    }
+
+    return stmt;
+}
+
+/* --- Match ----------------------------------------------------------------- */
+
+/* Match subject { Type.Variant(binding) { ... } ... }
+ *
+ * The type name is repeated on every arm rather than inferred from a leading
+ * `Match v {`, which keeps each arm self-describing and makes the exhaustiveness
+ * check a simple comparison against the declaration. */
+static Stmt *parse_match(Parser *parser) {
+    Position start = current(parser)->start;
+    advance_token(parser); /* Match */
+
+    Stmt *stmt = stmt_new(parser, STMT_MATCH, start);
+    if (stmt == NULL) return NULL;
+
+    /* Arms read `Type.Variant { ... }`, which the postfix parser would
+     * otherwise treat as a struct literal of a type named `Type`. The flag is
+     * set before the subject is parsed so that the '{' opening the Match body
+     * is never mistaken for the start of a literal either. */
+    parser->suppress_struct_literal = true;
+
+    stmt->expression = parse_expression(parser);
+    if (parser->failed) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    if (!consume(parser, TOKEN_LBRACE, "'{' to open a Match body")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    size_t capacity = 4;
+    stmt->arms = malloc(capacity * sizeof(MatchArm));
+    if (stmt->arms == NULL) {
+        stmt_free(stmt);
+        fail(parser, start, "out of memory");
+        return NULL;
+    }
+
+    while (!check(parser, TOKEN_RBRACE)) {
+        if (check(parser, TOKEN_EOF)) {
+            fail(parser, start, "unclosed '{' -- missing '}'");
+            stmt_free(stmt);
+            return NULL;
+        }
+
+        /* Each arm names its type: `Value.Number`. */
+        if (!check(parser, TOKEN_IDENT)) {
+            fail(parser, current(parser)->start,
+                 "expected a type name at the start of a Match arm, found %s",
+                 token_type_description(current(parser)->type));
+            stmt_free(stmt);
+            return NULL;
+        }
+        const Token *type_name = advance_token(parser);
+        if (!consume(parser, TOKEN_DOT, "'.' between a Match arm's type and variant")) {
+            stmt_free(stmt);
+            return NULL;
+        }
+        if (!is_name_token(current(parser)->type)) {
+            fail(parser, current(parser)->start,
+                 "expected a variant name after '.', found %s",
+                 token_type_description(current(parser)->type));
+            stmt_free(stmt);
+            return NULL;
+        }
+        const Token *variant_name = advance_token(parser);
+
+        if (stmt->arm_count + 1 > capacity) {
+            capacity *= 2;
+            MatchArm *grown = realloc(stmt->arms, capacity * sizeof(MatchArm));
+            if (grown == NULL) {
+                stmt_free(stmt);
+                fail(parser, start, "out of memory");
+                return NULL;
+            }
+            stmt->arms = grown;
+        }
+
+        MatchArm *arm = &stmt->arms[stmt->arm_count];
+        memset(arm, 0, sizeof(*arm));
+        arm->position = type_name->start;
+        arm->variant = copy_ident(variant_name);
+        stmt->arm_count++;
+
+        /* The declared type name is kept on the statement so the interpreter
+         * can verify every arm names the same type. */
+        if (stmt->arm_count == 1) {
+            stmt->name = copy_ident(type_name);
+        } else if (stmt->name != NULL &&
+                   strcmp(stmt->name, token_text_of(type_name)) != 0) {
+            fail(parser, type_name->start,
+                 "Match arms must all name the same type; this arm names a different one");
+            stmt_free(stmt);
+            return NULL;
+        }
+
+        /* Optional binding: `Value.Number(n)`. */
+        if (match(parser, TOKEN_LPAREN)) {
+            if (!check(parser, TOKEN_IDENT)) {
+                fail(parser, current(parser)->start,
+                     "expected a name to bind the payload to, found %s",
+                     token_type_description(current(parser)->type));
+                stmt_free(stmt);
+                return NULL;
+            }
+            arm->binding = copy_ident(advance_token(parser));
+            if (!consume(parser, TOKEN_RPAREN, "closing ')' after a payload binding")) {
+                stmt_free(stmt);
+                return NULL;
+            }
+        }
+
+        if (!parse_block(parser, &arm->body, &arm->body_count)) {
+            stmt_free(stmt);
+            return NULL;
+        }
+
+        /* Comma between arms is optional: each arm ends with its own block,
+         * so the next `Type.Variant` is unambiguous. Accepting both costs
+         * nothing and the no-comma form reads better. */
+        match(parser, TOKEN_COMMA);
+    }
+
+    parser->suppress_struct_literal = false;
+
+    if (!consume(parser, TOKEN_RBRACE, "closing '}'")) {
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    if (stmt->arm_count == 0) {
+        fail(parser, start, "Match must have at least one arm");
+        stmt_free(stmt);
+        return NULL;
+    }
+
+    return stmt;
+}
+
 static Stmt *parse_statement(Parser *parser) {
     /* Dispatch on the upcoming token. Each branch owns its own leading token,
      * so nothing is pre-consumed here. */
     switch (current(parser)->type) {
         case TOKEN_VARIABLE:   return parse_variable_declaration(parser);
         case TOKEN_FUNCTION:    return parse_function_declaration(parser);
+        case TOKEN_STRUCT:     return parse_aggregate(parser, DECL_STRUCT, TOKEN_STRUCT);
+        case TOKEN_UNION:      return parse_aggregate(parser, DECL_UNION, TOKEN_UNION);
+        /* `Error` is a union whose variants carry no payload. Parsed the same
+         * way so a variant list reads identically. */
+        case TOKEN_ERROR:      return parse_aggregate(parser, DECL_UNION, TOKEN_ERROR);
+        case TOKEN_MATCH:      return parse_match(parser);
         case TOKEN_IF:    return parse_if(parser);
     case TOKEN_LOOP:   return parse_loop(parser);
         case TOKEN_RETURN: {
