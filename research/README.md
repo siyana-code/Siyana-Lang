@@ -8,6 +8,7 @@ evidence base that decisions get argued from.
 
 | File | What it covers |
 | --- | --- |
+| [decisions.md](decisions.md) | Decisions made, with reasoning, including corrections and reversals |
 | [tooling/git-and-github.md](tooling/git-and-github.md) | Branching model, commit format, branch protection, CI, release |
 | [language/landscape.md](language/landscape.md) | Survey of existing systems languages and what each proves or disproves |
 | [language/bootstrap.md](language/bootstrap.md) | How a self-hosting compiler is actually built |
@@ -32,5 +33,5 @@ written down.
 
 ## Status
 
-The repository is at design stage. There is no compiler. These documents exist
-so that design arguments start from shared facts rather than from recall.
+The repository is at design stage. There is no compiler. The architecture plan
+lives in [../docs/architecture.md](../docs/architecture.md).
