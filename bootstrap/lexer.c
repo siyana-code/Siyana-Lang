@@ -29,7 +29,7 @@ static const char *const kTypeNames[] = {
     "True", "False",
     "Terminal", "Write", "ReadLine",
     "Struct", "Union", "Error", "Match",
-    "Result", "Try", "Catch", "Fail",
+    "Result", "Try", "Catch", "Fail", "Allocator",
     "'('", "')'", "'{'", "'}'", "','", "';'", "':'", "'.'",
     "'+'", "'-'", "'*'", "'/'", "'='", "'=='", "'!'", "'!='",
     "'<'", "'<='", "'>'", "'>='"
@@ -134,6 +134,11 @@ static TokenType keyword_type(const char *text, size_t length) {
         {"Error", TOKEN_ERROR}, {"Match", TOKEN_MATCH},
         {"Result", TOKEN_RESULT}, {"Try", TOKEN_TRY}, {"Catch", TOKEN_CATCH},
         {"Fail", TOKEN_FAIL},
+        /* Both spellings are the same token: `Allocator` constructs a region,
+         * `allocator` binds one for a block. They are distinguished by context
+         * -- an expression versus a statement -- and spelling them differently
+         * makes that distinction visible at a glance. */
+        {"Allocator", TOKEN_ALLOCATOR}, {"allocator", TOKEN_ALLOCATOR},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
         if (strlen(table[i].word) == length &&

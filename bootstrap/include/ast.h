@@ -26,6 +26,7 @@ typedef enum {
     STMT_UNION,
     STMT_MATCH,
     STMT_FAIL,
+    STMT_ALLOCATOR,
 
     /* Expressions */
     EXPR_NUMBER,
@@ -42,7 +43,8 @@ typedef enum {
     EXPR_FIELD,
     EXPR_UNION_INIT,
     EXPR_TRY,
-    EXPR_CATCH
+    EXPR_CATCH,
+    EXPR_ALLOCATOR_NEW
 } NodeType;
 
 /* What a type declaration defines. An Error is a union whose variants carry no
@@ -93,7 +95,13 @@ typedef enum {
     /* `Result{T, E}` -- a success type paired with an error set. Only valid as
      * a function return type; a variable of this type is deliberately not
      * expressible, so a fallible call cannot be bound and forgotten. */
-    TYPE_RESULT
+    TYPE_RESULT,
+
+    /* An allocator. A handle to a region, so unlike a struct it aliases on
+     * copy: two copies are the same arena, and both hand out the same bytes.
+     * That exception to value semantics is deliberate and is recorded in
+     * research/design/allocators.md. */
+    TYPE_ALLOCATOR
 } TypeKind;
 
 const char *type_kind_name(TypeKind type);

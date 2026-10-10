@@ -534,6 +534,64 @@ Rule 2 is what makes "the error type is in the signature" — the property that
 made error unions preferable to out-parameters — actually true rather than
 aspirational.
 
+## 24. Allocators hand out offsets, and deinit is explicit
+
+**Decision.** An `Allocator` owns a region. `Allocate` returns a **Word offset**
+into it, not a reference, and reads and writes go back through the allocator.
+
+```
+Variable arena: Allocator = Allocator(4096);
+Variable at: Word = arena.Allocate(16) Catch {
+    OutOfMemory { Fail OutOfMemory; }
+};
+arena.Store(at, 65);
+Variable byte: Character = arena.Load(at);
+
+allocator(scratch) {
+    Variable p: Word = Allocate(64) Catch { OutOfMemory { Fail OutOfMemory; } };
+}                                  // binding restored here
+```
+
+Two spellings, one token: `Allocator` constructs, `allocator` binds a block.
+Full detail: [design/allocators.md](design/allocators.md).
+
+**Offsets, not references.** The obvious first slice hands out `Buffer`
+handles, but Siyana has no pointers and open question 6 (does a Buffer alias,
+and who owns it) is deliberately undecided — it was deferred precisely because
+a pointer without an owner invites the leaks decision 14 exists to prevent.
+Building allocators would have forced that question as a side effect.
+
+Handing out offsets is not a degenerate compromise. It is what a kernel's page
+allocator does: it returns a frame number, and the kernel accesses the frame
+through the allocator. The target's most important case is the one this shape
+serves natively.
+
+**The cost is real and recorded.** Without a handle, every access re-names the
+allocator, so the ergonomics Model C was chosen for are not visible yet. The
+model is proven; the ergonomics arrive with buffers.
+
+**Automatic versus explicit deinit: explicit.** The prototype left this open.
+
+Automatic deinit on scope exit would free the region, and any buffer allocated
+in that scope and still referenced afterwards becomes a use-after-free — the
+language would *create* the dangling reference rather than fail to prevent one.
+In a kernel that is a page table pointing at freed physical memory.
+
+Explicit deinit can cause a leak. A leak is visible, bounded, and chosen. Given
+a language meant to run with no runtime that could catch either, choosing the
+failure mode that is loud over the one that is silent is the point. So
+`allocator(x) { ... }` binds and restores; it frees nothing.
+
+**`Memory { OutOfMemory }` is predeclared**, like `Number`. `Allocate` can then
+declare a signature without the user writing anything, and a program cannot
+redefine `OutOfMemory` with different contents and quietly change what
+`Allocate` means.
+
+**One deliberate exception to value semantics.** An `Allocator` aliases on copy:
+two copies are the same arena. Copying an allocator would otherwise copy its
+memory and hand out the same bytes twice. Structs copy (decision 21);
+allocators alias; the distinction is in the type, not in folklore.
+
 ## Open decisions
 
 Not yet made:
@@ -545,11 +603,12 @@ Not yet made:
    payload gives every variant its own type, and the syntax being added was
    already the risky part. The binding slot `NotFound(code)` is in the grammar
    so adding them later is additive rather than a redesign.
-5. Automatic versus explicit arena deinit. See decision 14.
-6. Pointers and borrows. Decision 21 makes structs values; a `Word` serves as
-   an integer but nothing yet means "a reference to a struct." Blocked on 1 and
-   on the allocator model, since a pointer without an owner invites the leaks
-   decision 14 exists to prevent.
+5. Automatic versus explicit arena deinit. **Decided: explicit** — see
+   decision 24.
+6. Pointers and borrows. Decision 21 makes structs values and decision 24 makes
+   allocators hand out offsets; nothing yet means "a reference to a struct."
+   This is now the blocker for buffers, and for the ergonomics the allocator
+   model was chosen for.
 7. May a variable hold a `Result{T, E}`? Currently no, deliberately. See
    decision 23.
 

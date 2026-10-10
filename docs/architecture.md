@@ -174,7 +174,7 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
 
 - A tagged union with a payload compiles and runs. — **met**
 - An error propagates from a deep call stack with its context intact. — **met**
-- An allocation failure is surfaced as a value, never a crash.
+- An allocation failure is surfaced as a value, never a crash. — **met**
 - A test suite exists that is expressive enough to write the OS in. — **partly**
 
 **Done so far**
@@ -186,15 +186,17 @@ wrong, so it is designed rather than improvised. See "Allocator model" below.
   `Match` with exhaustiveness checking (decision 22).
 - Error sets, `Result{T, E}` return types, `Try`, `Catch`, and `Fail`, with
   per-function error sets and two enforced rules (decision 23).
+- Allocators with lexically scoped `allocator(x) { }` binding, handing out
+  offsets, restoring on every exit path including error propagation
+  (decision 24).
 
-**Remaining, in the order the design forces**
+**Remaining**
 
-1. Compile-time evaluation — still undecided, and it is the last Phase 3 item
-   that is a *choice* rather than a build.
-2. The allocator block form, which needs errors to unwind past — they now
-   exist, so this is unblocked. `allocator(x) { }` binds on entry and restores
-   on exit, including on the propagating path.
-3. Pointers, once the allocator model is in place.
+1. Compile-time evaluation — still undecided, and the last Phase 3 item that is
+   a *choice* rather than a build.
+2. Buffers and borrows, which unblock the ergonomics the allocator model was
+   chosen for. Allocators currently hand out offsets because nothing yet means
+   "a reference to a struct" (decision 24).
 
 **[Known defect]** Every struct and union value leaks its `fields` array.
 `free_aggregate_fields` is reached only from the error paths inside

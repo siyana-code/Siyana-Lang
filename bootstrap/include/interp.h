@@ -27,7 +27,8 @@ typedef enum {
     VALUE_STRING,
     VALUE_STRUCT,
     VALUE_UNION,
-    VALUE_RESULT
+    VALUE_RESULT,
+    VALUE_ALLOCATOR
 } ValueType;
 
 /* A struct or union value.
@@ -71,6 +72,11 @@ struct Value {
         struct { const char *chars; size_t length; } string;
         Aggregate aggregate;
         ResultValue result;
+        /* An owned bump allocator. The arena is reference-counted here rather
+         * than deep-copied, because copying an allocator should not copy its
+         * memory: two copies handing out the same region would hand out the
+         * same bytes twice. */
+        struct Allocator *allocator;
     } as;
     /* Set when the value came from the True or False literal, so output can
      * show the source form. Presentation only -- truthiness follows the
